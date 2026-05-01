@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (
     QFrame, QLabel, QPushButton, QListWidget, QListWidgetItem,
     QFileDialog, QMessageBox, QSizePolicy,
     QStatusBar, QToolBar, QMenu, QColorDialog, QDialog, QDialogButtonBox,
-    QLineEdit, QStackedWidget, QButtonGroup,
+    QLineEdit, QStackedWidget, QButtonGroup, QComboBox,
 )
 from PyQt6.QtCore import Qt, QSize, QPoint, pyqtSignal
 from PyQt6.QtGui import QColor, QCursor
@@ -17,6 +17,11 @@ from app.project import Project
 from app.gallery import GalleryWidget
 from app.yolo_exporter import YoloExporter
 from app.styles import CLASS_COLORS
+# [DB] Importamos el gestor de base de datos DuckDB
+from app.database import DatabaseManager
+
+from app.analytics import AnalyticsWidget
+from app.yolo_engine import TrainWidget, InferenceWidget
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,31 +116,74 @@ class BBoxOverlay(QWidget):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Diálogo para crear nueva etiqueta
+# Diálogo para crear / seleccionar etiqueta (con QComboBox de la BD)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AddClassDialog(QDialog):
-    def __init__(self, suggested_color: str, parent=None):
+    """Diálogo que sugiere las clases existentes en la BD mediante un QComboBox.
+
+    Args:
+        suggested_color: Color hex sugerido para clases nuevas.
+        db_classes:      Lista de LabelClass ya registradas en DuckDB.
+                         Se usa para rellenar el combo y para detectar
+                         si el nombre introducido es nuevo.
+        parent:          Widget padre Qt.
+    """
+
+    # Resultado de la validación: True = clase nueva confirmada por usuario
+    new_class_confirmed: bool = False
+
+    def __init__(
+        self,
+        suggested_color: str,
+        db_classes: list,          # list[LabelClass]
+        parent=None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Nueva etiqueta")
-        self.setFixedWidth(320)
+        self.setWindowTitle("Seleccionar / nueva etiqueta")
+        self.setFixedWidth(360)
         self.setModal(True)
         self._color = suggested_color
+        # [DB] Clases conocidas en la BD; usamos el nombre como clave de búsqueda
+        self._db_class_names: list[str] = [c.name for c in db_classes]
+        self._db_classes_by_name: dict[str, object] = {c.name: c for c in db_classes}
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        lbl_name = QLabel("Nombre de la etiqueta")
-        lbl_name.setStyleSheet("color: #89b4fa; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+        # — Etiqueta + combo —
+        lbl_name = QLabel("Etiqueta")
+        lbl_name.setStyleSheet(
+            "color: #89b4fa; font-size: 11px; font-weight: bold; letter-spacing: 1px;"
+        )
         layout.addWidget(lbl_name)
 
-        self._name_input = QLineEdit()
-        self._name_input.setPlaceholderText("ej: persona, coche, perro…")
-        layout.addWidget(self._name_input)
+        # [DB] QComboBox editable: permite seleccionar o escribir libremente
+        self._combo = QComboBox()
+        self._combo.setEditable(True)
+        self._combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._combo.addItems(self._db_class_names)
+        self._combo.setCurrentIndex(-1)
+        self._combo.lineEdit().setPlaceholderText("Selecciona o escribe un nombre…")
+        self._combo.setStyleSheet(
+            "QComboBox { background: #313244; color: #cdd6f4; border: 1px solid #45475a;"
+            " border-radius: 6px; padding: 6px 10px; font-size: 13px; }"
+            "QComboBox QAbstractItemView { background: #1e1e2e; color: #cdd6f4;"
+            " selection-background-color: #45475a; }"
+        )
+        layout.addWidget(self._combo)
 
+        # [DB] Hint informativo
+        hint = QLabel(f"{len(self._db_class_names)} clase(s) disponible(s) en la base de datos")
+        hint.setStyleSheet("color: #6c7086; font-size: 11px; font-style: italic;")
+        layout.addWidget(hint)
+
+        # — Color —
         lbl_color = QLabel("Color")
-        lbl_color.setStyleSheet("color: #89b4fa; font-size: 11px; font-weight: bold; letter-spacing: 1px;")
+        lbl_color.setStyleSheet(
+            "color: #89b4fa; font-size: 11px; font-weight: bold; letter-spacing: 1px;"
+        )
         layout.addWidget(lbl_color)
 
         color_row = QHBoxLayout()
@@ -152,6 +200,7 @@ class AddClassDialog(QDialog):
         color_row.addStretch()
         layout.addLayout(color_row)
 
+        # — Botones —
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -162,7 +211,19 @@ class AddClassDialog(QDialog):
         layout.addWidget(buttons)
 
         self._color_preview.clicked.connect(self._pick_color)
-        self._name_input.setFocus()
+        # [DB] Sincronizar color del combo al seleccionar clase existente
+        self._combo.currentTextChanged.connect(self._on_combo_text_changed)
+        self._combo.setFocus()
+
+    # ------------------------------------------------------------------ #
+
+    def _on_combo_text_changed(self, text: str) -> None:
+        """Rellena el color automáticamente si se selecciona una clase de la BD."""
+        cls = self._db_classes_by_name.get(text)
+        if cls:
+            self._color = cls.color
+            self._apply_color_preview()
+            self._color_label.setText(self._color)
 
     def _apply_color_preview(self):
         self._color_preview.setStyleSheet(
@@ -180,14 +241,32 @@ class AddClassDialog(QDialog):
             self._color_label.setText(self._color)
 
     def _on_accept(self):
-        if not self._name_input.text().strip():
-            self._name_input.setPlaceholderText("⚠ Escribe un nombre")
-            self._name_input.setFocus()
+        name = self._combo.currentText().strip()
+        if not name:
+            self._combo.lineEdit().setPlaceholderText("⚠ Elige o escribe un nombre")
+            self._combo.setFocus()
             return
+
+        # [DB] Validación preventiva: si el nombre NO está en la BD, confirmar
+        if name not in self._db_class_names:
+            reply = QMessageBox.question(
+                self,
+                "Clase no registrada",
+                f"\u2018{name}\u2019 no existe en la base de datos.\n"
+                "¿Deseas crearla como nueva categoría oficial?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,   # Botón por defecto: No (más seguro)
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return   # El usuario cancela → no cerrar el diálogo
+            # [DB] Marcamos que esta clase es nueva y debe insertarse en BD
+            self.new_class_confirmed = True
+
         self.accept()
 
     def get_result(self) -> tuple[str, str]:
-        return self._name_input.text().strip(), self._color
+        """Devuelve (nombre, color_hex) elegidos por el usuario."""
+        return self._combo.currentText().strip(), self._color
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,9 +317,17 @@ class MainWindow(QMainWindow):
         self._selected_item: BBoxItem | None = None
         self._next_color_index = 0
 
+        # [DB] Inicializar base de datos y crear tablas si no existen
+        self._db = DatabaseManager()
+        self._db.initialize_tables()
+        # [DB] Sembrar proyecto y clases por defecto al arrancar
+        self._db_seed_default_project()
+
         self._build_ui()
         self._overlay = BBoxOverlay(self.canvas.viewport())
         self._connect_signals()
+        # [DB] Cargar clases de la BD en el panel lateral (sincronización inicial)
+        self._db_load_classes_into_ui()
         self._update_ui_state()
 
     # ------------------------------------------------------------------ #
@@ -319,6 +406,7 @@ class MainWindow(QMainWindow):
 
         # — Exportar —
         self.btn_export = QPushButton("Exportar YOLO")
+        
         toolbar.addWidget(self.btn_export)
 
         # — Layout central: nav rail + stacked pages —
@@ -345,8 +433,17 @@ class MainWindow(QMainWindow):
         page_layout.addWidget(self._build_right_panel())
         self._stack.addWidget(labeling_page)
 
-        # Página 1 — Train (placeholder)
-        self._stack.addWidget(self._build_train_page())
+        # Página 1 — Analytics
+        self.analytics_page = AnalyticsWidget(db=self._db, project_id=self._PROJECT_ID)
+        self._stack.addWidget(self.analytics_page)
+
+        # Página 2 — Train
+        self.train_page = TrainWidget()
+        self._stack.addWidget(self.train_page)
+
+        # Página 3 — Inference
+        self.inference_page = InferenceWidget()
+        self._stack.addWidget(self.inference_page)
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
@@ -367,16 +464,22 @@ class MainWindow(QMainWindow):
         layout.setSpacing(2)
 
         self._btn_nav_labeling = self._make_nav_button("🏷", "Labeling")
+        self._btn_nav_analytics = self._make_nav_button("📊", "Analítica")
         self._btn_nav_train    = self._make_nav_button("🧠", "Train")
+        self._btn_nav_inference = self._make_nav_button("👁", "Inferencia")
         self._btn_nav_labeling.setChecked(True)
 
         layout.addWidget(self._btn_nav_labeling)
+        layout.addWidget(self._btn_nav_analytics)
         layout.addWidget(self._btn_nav_train)
+        layout.addWidget(self._btn_nav_inference)
         layout.addStretch()
 
         self._nav_group = QButtonGroup(self)
         self._nav_group.addButton(self._btn_nav_labeling, 0)
-        self._nav_group.addButton(self._btn_nav_train, 1)
+        self._nav_group.addButton(self._btn_nav_analytics, 1)
+        self._nav_group.addButton(self._btn_nav_train, 2)
+        self._nav_group.addButton(self._btn_nav_inference, 3)
 
         return rail
 
@@ -523,8 +626,8 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self._on_save_project)
         self.btn_prev.clicked.connect(self._on_prev)
         self.btn_next.clicked.connect(self._on_next)
-        self.btn_draw.toggled.connect(self._on_toggle_draw_mode)
-        self.btn_export.clicked.connect(self._on_export_yolo)
+        self.btn_draw.clicked.connect(self._on_draw_clicked)
+        self.btn_export.clicked.connect(self._on_export_yolo)  # [DB] Única conexión, sin duplicados
 
         self.btn_zoom_fit.clicked.connect(self._zoom_fit)
         self.btn_zoom_in.clicked.connect(self._zoom_in)
@@ -545,6 +648,228 @@ class MainWindow(QMainWindow):
 
         self._overlay.class_change_requested.connect(self._on_overlay_class_change)
         self._overlay.delete_requested.connect(self._on_overlay_delete)
+
+    # ------------------------------------------------------------------ #
+    # [DB] Lógica de siembra inicial (proyecto 'default' y clases YOLO)
+    # ------------------------------------------------------------------ #
+
+    def _db_seed_default_project(self) -> None:
+        """Crea el proyecto 'animales' y sus clases YOLO si no existen aún.
+
+        Diseño idempotente: si ya existen, no hace nada.
+        ID de proyecto fijo: 'animales' (clave de negocio legible).
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        # [DB] ID canónico del proyecto — debe coincidir en TODAS las tablas
+        PROJECT_ID = "animales"
+
+        # --- Proyecto ---
+        existing_project = self._db.conn.execute(
+            "SELECT id FROM projects WHERE id = ?",
+            (PROJECT_ID,),
+        ).fetchone()
+
+        if existing_project is None:
+            # [DB] El proyecto no existe → lo creamos
+            self._db.conn.execute(
+                """
+                INSERT INTO projects (id, name, description, base_path, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    PROJECT_ID,                             # id = 'animales'
+                    "animales",                             # nombre del proyecto
+                    "Proyecto de clasificación de animales",
+                    "",                                     # base_path (sin carpeta fija aún)
+                    now,
+                    now,
+                ),
+            )
+
+        # --- Clases YOLO (perros=0, gatos=1, caballos=2) ---
+        # [DB] Definición canónica: (nombre, yolo_index, color_hex)
+        _DEFAULT_CLASSES = [
+            ("perros",   0, "#f38ba8"),
+            ("gatos",    1, "#a6e3a1"),
+            ("caballos", 2, "#89b4fa"),
+        ]
+
+        for class_name, yolo_idx, color in _DEFAULT_CLASSES:
+            existing_cls = self._db.conn.execute(
+                "SELECT id FROM classes WHERE project_id = ? AND yolo_index = ?",
+                (PROJECT_ID, yolo_idx),
+            ).fetchone()
+
+            if existing_cls is None:
+                # [DB] La clase no existe → la insertamos con un UUID propio
+                self._db.conn.execute(
+                    """
+                    INSERT INTO classes (id, project_id, name, color, yolo_index)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),  # UUID único para la FK relacional
+                        PROJECT_ID,
+                        class_name,
+                        color,
+                        yolo_idx,
+                    ),
+                )
+
+    # [DB] Constante de proyecto usada en upsert e imagen
+    _PROJECT_ID = "animales"
+
+    def _db_upsert_image(self, image_path: str, width: int, height: int) -> str:
+        """Garantiza que la imagen esté registrada en la tabla images.
+
+        Si ya existe (por file_path), devuelve su id sin modificarla.
+        Si no existe, la inserta y devuelve el nuevo id.
+
+        Returns:
+            UUID de la fila en la tabla images.
+        """
+        import uuid
+        from datetime import datetime, timezone
+
+        # [DB] Buscar por ruta de archivo (clave de negocio)
+        row = self._db.conn.execute(
+            "SELECT id FROM images WHERE file_path = ?",
+            (image_path,),
+        ).fetchone()
+
+        if row is not None:
+            return row[0]   # Ya existe → devolvemos su UUID
+
+        # [DB] No existe → insertar nueva fila
+        new_id = str(uuid.uuid4())
+        self._db.conn.execute(
+            """
+            INSERT INTO images
+                (id, project_id, file_path, split, width, height, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_id,
+                self._PROJECT_ID,   # [DB] 'animales' — consistente con el proyecto
+                image_path,
+                "train",            # split por defecto
+                width,
+                height,
+                "annotated",
+                datetime.now(timezone.utc),
+            ),
+        )
+        return new_id
+
+    def _db_resolve_class_uuid(
+        self,
+        label_class: "LabelClass",
+    ) -> str | None:
+        """Devuelve el UUID de BD para una clase, con confirmación interactiva.
+
+        Flujo:
+        1. Busca la clase en la BD por yolo_index dentro del proyecto 'animales'.
+        2. Si existe, devuelve su UUID silenciosamente.
+        3. Si NO existe, muestra QMessageBox.question al usuario:
+           - 'Sí': la registra en la BD y devuelve el nuevo UUID.
+           - 'No': devuelve None (el bbox se omite del guardado en BD).
+
+        Args:
+            label_class: Objeto LabelClass de la anotación actual.
+
+        Returns:
+            UUID (str) si la clase está o se ha creado, None si el usuario cancela.
+        """
+        import uuid
+
+        # [DB] Lookup relacional: yolo_index dentro del proyecto 'animales'
+        row = self._db.conn.execute(
+            "SELECT id FROM classes WHERE project_id = ? AND yolo_index = ?",
+            (self._PROJECT_ID, label_class.class_id),
+        ).fetchone()
+
+        if row is not None:
+            return row[0]   # Clase ya registrada → devolvemos su UUID
+
+        # [DB] La clase NO está en la BD → preguntamos al usuario antes de crear nada
+        reply = QMessageBox.question(
+            self,
+            "Clase no registrada",
+            f"La clase \u2018{label_class.name}\u2019 no existe en la base de datos.\n"
+            "\u00bfDeseas crearla como una nueva categoría oficial?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,   # Botón por defecto: No (más seguro)
+        )
+
+        if reply == QMessageBox.StandardButton.No:
+            # [DB] El usuario canceló → se omite este bbox del guardado en BD
+            return None
+
+        # [DB] El usuario aceptó → insertar con parámetros ? (sin SQL injection)
+        new_uuid = str(uuid.uuid4())
+        self._db.conn.execute(
+            """
+            INSERT INTO classes (id, project_id, name, color, yolo_index)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                new_uuid,
+                self._PROJECT_ID,       # [DB] 'animales'
+                label_class.name,
+                label_class.color,
+                label_class.class_id,
+            ),
+        )
+        # [DB] Confirmación visual en la barra de estado
+        self.status_bar.showMessage(
+            f"✅ Clase \u2018{label_class.name}\u2019 dada de alta en la base de datos."
+        )
+        return new_uuid
+
+    # ------------------------------------------------------------------ #
+    # [DB] Carga inicial de clases desde DuckDB a la UI
+    # ------------------------------------------------------------------ #
+
+    def refresh_classes_from_db(self) -> None:
+        """Lee la tabla classes desde DuckDB y sincroniza self._classes + el QListWidget.
+
+        Debe llamarse siempre que algo pueda haber cambiado el estado de las clases:
+        - Al arrancar la aplicación.
+        - Al cargar una imagen o carpeta (_load_project).
+        - Después de crear una nueva clase en _on_add_class.
+
+        Es completamente idempotente: limpia primero y reconstruye desde cero.
+        """
+        rows = self._db.conn.execute(
+            """
+            SELECT id, name, color, yolo_index
+            FROM   classes
+            WHERE  project_id = ?
+            ORDER  BY yolo_index
+            """,
+            (self._PROJECT_ID,),
+        ).fetchall()
+
+        self._classes.clear()
+        self.class_list.clear()
+
+        for _uuid, name, color, yolo_idx in rows:
+            # [DB] Construimos LabelClass con yolo_index como class_id para el canvas
+            lc = LabelClass(name=name, color=color, class_id=yolo_idx)
+            self._classes.append(lc)
+            self._add_class_to_list(lc)
+
+        self._next_color_index = len(self._classes)
+        if self._classes:
+            self.status_bar.showMessage(
+                f"✅ {len(self._classes)} clase(s) cargada(s) desde la base de datos."
+            )
+
+    # Alias interno para compatibilidad con el arranque inicial
+    _db_load_classes_into_ui = refresh_classes_from_db
 
     # ------------------------------------------------------------------ #
     # Abrir imagen / carpeta
@@ -608,13 +933,8 @@ class MainWindow(QMainWindow):
 
     def _load_project(self, project: Project):
         self._project = project
-        self._classes = list(project.classes)
-        self._next_color_index = len(self._classes)
-
-        # Reconstruir lista de clases en la UI
-        self.class_list.clear()
-        for cls in self._classes:
-            self._add_class_to_list(cls)
+        # [DB] NO usamos project.classes: la BD es la fuente de verdad.
+        # refresh_classes_from_db() se encarga de limpiar y recargar desde DuckDB.
 
         # Cargar galería
         self.gallery.load_images(project.image_paths)
@@ -624,6 +944,9 @@ class MainWindow(QMainWindow):
 
         self.lbl_gallery_count.setText(f"{project.image_count} img")
         self._update_ui_state()
+
+        # [DB] Refrescar clases desde la BD SIEMPRE al cargar un proyecto/imagen
+        self.refresh_classes_from_db()
 
     # ------------------------------------------------------------------ #
     # Navegación
@@ -640,6 +963,9 @@ class MainWindow(QMainWindow):
         self._current_image_path = image_path
         w, h = self.canvas.get_image_size()
         self._annotation = self._project.get_or_create_annotation(image_path, w, h)
+
+        # [DB] Upsert: registrar la imagen en la BD si no existe todavía
+        self._db_upsert_image(image_path, w, h)
 
         self.canvas.clear_all_boxes()
         for box in self._annotation.boxes:
@@ -703,18 +1029,71 @@ class MainWindow(QMainWindow):
 
     def _on_add_class(self):
         suggested = CLASS_COLORS[self._next_color_index % len(CLASS_COLORS)]
-        dialog = AddClassDialog(suggested_color=suggested, parent=self)
+        # [DB] Pasamos las clases de la BD al diálogo para que rellene el combo
+        dialog = AddClassDialog(
+            suggested_color=suggested,
+            db_classes=self._classes,
+            parent=self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         name, color = dialog.get_result()
         if any(c.name == name for c in self._classes):
-            self.status_bar.showMessage(f"La clase '{name}' ya existe.")
+            self.status_bar.showMessage(f"La clase \u2018{name}\u2019 ya está activa en la UI.")
             return
-        label_class = LabelClass(name=name, color=color, class_id=len(self._classes))
+        yolo_idx = len(self._classes)
+        label_class = LabelClass(name=name, color=color, class_id=yolo_idx)
         self._classes.append(label_class)
         self._add_class_to_list(label_class)
         self.class_list.setCurrentRow(self.class_list.count() - 1)
         self._next_color_index += 1
+
+        # [DB] Evitar duplicados: comprobar si el nombre YA existe en la BD
+        if dialog.new_class_confirmed:
+            import uuid
+            existing_row = self._db.conn.execute(
+                "SELECT id FROM classes WHERE project_id = ? AND name = ?",
+                (self._PROJECT_ID, name),
+            ).fetchone()
+
+            if existing_row is not None:
+                # El nombre ya existe en BD → reutilizamos ese UUID, no insertamos
+                self.status_bar.showMessage(
+                    f"ℹ️ Clase \u2018{name}\u2019 ya existía en BD (reutilizada, sin duplicar)."
+                )
+            else:
+                # No existe → insertar con UUID nuevo
+                self._db.conn.execute(
+                    """
+                    INSERT INTO classes (id, project_id, name, color, yolo_index)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        self._PROJECT_ID,   # [DB] 'animales'
+                        name,
+                        color,
+                        yolo_idx,
+                    ),
+                )
+                self.status_bar.showMessage(
+                    f"✅ Clase \u2018{name}\u2019 registrada en la BD y añadida a la UI."
+                )
+        else:
+            # Clase existente seleccionada del combo → ya está en BD
+            self.status_bar.showMessage(
+                f"Clase \u2018{name}\u2019 añadida a la UI (ya existía en BD)."
+            )
+
+        # [DB] Refrescar la UI desde la BD para garantizar consistencia total
+        self.refresh_classes_from_db()
+
+        # [UX] Seleccionar automáticamente la clase para que el usuario pueda empezar a dibujar
+        for i in range(self.class_list.count()):
+            item = self.class_list.item(i)
+            if isinstance(item, ClassListItem) and item.label_class.name == name:
+                self.class_list.setCurrentItem(item)
+                break
 
     def _add_class_to_list(self, label_class: LabelClass):
         item = ClassListItem(label_class)
@@ -745,15 +1124,80 @@ class MainWindow(QMainWindow):
     # Bboxes
     # ------------------------------------------------------------------ #
 
+    def _db_persist_current_annotation(self) -> None:
+        """Guarda en DuckDB el estado actual de anotaciones para la imagen visible.
+
+        Diseño Database-First: se llama cada vez que se crea, elimina o modifica
+        un bbox, en lugar de esperar a 'Exportar'. Usa replace=True para que la
+        BD siempre refleje exactamente lo que hay en el canvas.
+
+        Es un no-op seguro si no hay imagen cargada o la anotación está vacía.
+        """
+        if not self._annotation or not self._current_image_path:
+            return
+
+        w = self._annotation.image_width
+        h = self._annotation.image_height
+
+        # [DB] Upsert de la imagen para garantizar la FK
+        image_db_id = self._db_upsert_image(self._current_image_path, w, h)
+
+        # [DB] Mapear yolo_index → UUID de la tabla classes para cada bbox
+        boxes_for_db: list[BoundingBox] = []
+        for box in self._annotation.boxes:
+            cls_row = self._db.conn.execute(
+                "SELECT id FROM classes WHERE project_id = ? AND yolo_index = ?",
+                (self._PROJECT_ID, box.label_class.class_id),
+            ).fetchone()
+            if cls_row is None:
+                # Clase aún no persistida (no debería ocurrir con el nuevo flujo)
+                continue
+            boxes_for_db.append(
+                BoundingBox(
+                    x=box.x, y=box.y,
+                    width=box.width, height=box.height,
+                    label_class=LabelClass(
+                        name=box.label_class.name,
+                        color=box.label_class.color,
+                        class_id=cls_row[0],   # UUID para la FK relacional
+                    ),
+                    id=box.id,
+                )
+            )
+
+        # [DB] Construir el ImageAnnotation auxiliar y guardar (replace=True)
+        annotation_for_db = ImageAnnotation(
+            image_path=self._current_image_path,
+            image_width=w,
+            image_height=h,
+            boxes=boxes_for_db,
+        )
+        try:
+            self._db.save_image_annotation(
+                image_id=image_db_id,
+                annotation=annotation_for_db,
+                replace=False,  # NO usamos replace=True; la BD debe acumular anotaciones.
+            )
+        except Exception as exc:
+            # No interrumpimos el flujo de UI por un error de BD; sí lo notificamos
+            self.status_bar.showMessage(f"⚠ Error al guardar en BD: {exc}")
+
     def _on_box_created(self, bbox: BoundingBox):
         if self._annotation:
             self._annotation.add_box(bbox)
             self._refresh_box_count()
+            # [DB] Persistencia inmediata tras crear un bbox
+            self._db_persist_current_annotation()
 
     def _on_box_deleted(self, box_id: str):
         if self._annotation:
             self._annotation.remove_box(box_id)
             self._refresh_box_count()
+            # [DB] Borrar explícitamente el bbox de la BD
+            try:
+                self._db.conn.execute("DELETE FROM annotations WHERE id = ?", (box_id,))
+            except Exception as e:
+                self.status_bar.showMessage(f"⚠ Error al borrar en BD: {e}")
 
     def _on_clear_all(self):
         if not self._annotation:
@@ -763,6 +1207,13 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
+            # [DB] Borrar explícitamente los bboxes actuales de la BD
+            try:
+                for box in self._annotation.boxes:
+                    self._db.conn.execute("DELETE FROM annotations WHERE id = ?", (box.id,))
+            except Exception as e:
+                self.status_bar.showMessage(f"⚠ Error al borrar en BD: {e}")
+
             self._overlay.hide()
             self._selected_item = None
             self.canvas.clear_all_boxes()
@@ -804,6 +1255,8 @@ class MainWindow(QMainWindow):
         if self._selected_item and self._selected_item.bbox.id == box_id:
             self._overlay.update_content(box_id, new_class.name, new_class.color, self._classes)
             self._reposition_overlay()
+        # [DB] Persistencia inmediata tras cambio de clase en un bbox
+        self._db_persist_current_annotation()
 
     def _on_overlay_delete(self, box_id: str):
         self._selected_item = None
@@ -813,23 +1266,120 @@ class MainWindow(QMainWindow):
     # Dibujo y exportar
     # ------------------------------------------------------------------ #
 
-    def _on_toggle_draw_mode(self, checked: bool):
-        self.canvas.set_draw_mode(checked)
-        self.btn_draw.setText("Dibujar  ■" if checked else "Dibujar bbox")
-        if checked:
+    def _on_draw_clicked(self):
+        """Gestiona el clic en 'Dibujar bbox' con validación de clase activa.
+
+        Flujo:
+        1. Si el modo dibujo YA estaba activo → lo desactiva (toggle off).
+        2. Si se intenta activar SIN clase seleccionada → aviso + no activa.
+        3. Si hay clase seleccionada → activa el modo dibujo en el canvas.
+        """
+        # Estado actual: ¿estaba activo antes del clic?
+        # btn_draw es checkable; Qt invierte el estado antes de emitir clicked,
+        # así que self.btn_draw.isChecked() ya refleja el NUEVO estado deseado.
+        want_draw = self.btn_draw.isChecked()
+
+        if want_draw:
+            # Verificar si hay clase seleccionada
+            current_item = self.class_list.currentItem()
+            if not current_item or not isinstance(current_item, ClassListItem):
+                # Sin clase → mostrar aviso y revertir el estado del botón
+                QMessageBox.warning(
+                    self,
+                    "Sin clase seleccionada",
+                    "Debes seleccionar una clase en la lista de la derecha "
+                    "(por ejemplo: perros, gatos, caballos) antes de dibujar.",
+                )
+                self.btn_draw.setChecked(False)   # revertir el toggle
+                return
+
+            # Activar modo dibujo con la clase activa
+            self.canvas.set_draw_mode(True)
+            self.btn_draw.setText("✏️  Dibujando...")
             self._overlay.hide()
+            self.status_bar.showMessage(
+                f"✏️ Modo dibujo activo — clase: {current_item.label_class.name}  "
+                "| Arrastra para crear un bbox | Clic en el botón para salir"
+            )
+        else:
+            # Desactivar modo dibujo
+            self.canvas.set_draw_mode(False)
+            self.btn_draw.setText("Dibujar bbox")
 
     def _on_export_yolo(self):
-        if not self._annotation or not self._annotation.boxes:
-            QMessageBox.information(self, "Sin datos",
-                                    "No hay anotaciones que exportar.")
+        """Exporta las anotaciones a archivos .txt YOLO.
+
+        Genera el archivo completo basándose en TODO lo que hay en la BD para
+        esa imagen, no sólo lo que hay en la sesión actual.
+        """
+        if not self._current_image_path:
+            QMessageBox.information(self, "Sin imagen", "No hay imagen cargada.")
             return
+
         try:
-            out_file = YoloExporter.export(self._annotation)
-            YoloExporter.export_classes(self._annotation)
+            # 1. Recuperar info de imagen desde BD
+            row = self._db.conn.execute(
+                "SELECT id, width, height FROM images WHERE file_path = ?",
+                (self._current_image_path,)
+            ).fetchone()
+            
+            if not row:
+                raise ValueError("La imagen no está registrada en la base de datos.")
+            
+            img_id, w, h = row
+            
+            # 2. Recuperar anotaciones de la BD
+            db_boxes = self._db.get_annotations_for_image(img_id)
+            if not db_boxes:
+                QMessageBox.information(self, "Sin datos", "No hay anotaciones en BD que exportar.")
+                return
+
+            # 3. Construir ImageAnnotation completo
+            full_annotation = ImageAnnotation(
+                image_path=self._current_image_path,
+                image_width=w,
+                image_height=h,
+            )
+
+            for b in db_boxes:
+                cls_row = self._db.conn.execute(
+                    "SELECT name, color, yolo_index FROM classes WHERE id = ?",
+                    (b["class_id"],)
+                ).fetchone()
+                if not cls_row:
+                    continue
+                c_name, c_color, c_yolo = cls_row
+
+                # Revertir de coordenadas normalizadas YOLO a píxeles
+                bw = b["width"] * w
+                bh = b["height"] * h
+                bx = (b["x_center"] * w) - (bw / 2)
+                by = (b["y_center"] * h) - (bh / 2)
+
+                bbox = BoundingBox(
+                    x=bx, y=by, width=bw, height=bh,
+                    label_class=LabelClass(name=c_name, color=c_color, class_id=c_yolo),
+                    id=b["id"]
+                )
+                full_annotation.add_box(bbox)
+
+            # 4. Exportar el .txt de YOLO con las anotaciones combinadas
+            out_file = YoloExporter.export(full_annotation)
+            
+            # 5. Generar classes.txt con TODAS las clases del proyecto, en orden
+            classes_rows = self._db.conn.execute(
+                "SELECT name FROM classes WHERE project_id = ? ORDER BY yolo_index",
+                (self._PROJECT_ID,)
+            ).fetchall()
+            
+            classes_lines = [r[0] for r in classes_rows]
+            from pathlib import Path
+            out_classes = Path(self._current_image_path).parent / "classes.txt"
+            out_classes.write_text("\n".join(classes_lines) + "\n", encoding="utf-8")
+
             QMessageBox.information(self, "Exportación completada",
-                                    f"Guardado en:\n{out_file}")
-            self.status_bar.showMessage(f"Exportado: {out_file}")
+                                    f"Generado archivo combinando anotaciones de la BD:\n{out_file}")
+            self.status_bar.showMessage(f"Exportado desde BD: {out_file}")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -857,6 +1407,8 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(index)
         self._overlay.hide()
         self._update_ui_state()
+        if index == 1:
+            self.analytics_page.refresh_data()
 
     def _refresh_box_count(self):
         count = len(self._annotation.boxes) if self._annotation else 0
@@ -908,4 +1460,6 @@ class MainWindow(QMainWindow):
             self._commit_current_annotation()
             self._project.classes = self._classes
             self._project.save()
+        # [DB] Cerrar la conexión a DuckDB de forma limpia al salir
+        self._db.close()
         event.accept()
