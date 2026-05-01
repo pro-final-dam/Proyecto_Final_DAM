@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from app.main_window import MainWindow; print\\('OK'\\)\")",
+      "Read(//c/Users/javier.canales/AppData/Local/Programs/**)",
+      "Read(//c/Program Files/**)",
+      "PowerShell(py -3 --version 2>&1)",
+      "PowerShell(py -3 -c \"import sys; print\\(sys.executable\\)\")",
+      "PowerShell(winget --version 2>&1)",
+      "PowerShell(Get-Command winget -ErrorAction SilentlyContinue)",
+      "PowerShell(winget install Python.Python.3.11 --silent --accept-package-agreements --accept-source-agreements 2>&1)",
+      "PowerShell($env:Path = [System.Environment]::GetEnvironmentVariable\\(\"Path\",\"Machine\"\\) + \";\" + [System.Environment]::GetEnvironmentVariable\\(\"Path\",\"User\"\\); python --version 2>&1)",
+      "PowerShell($env:Path = [System.Environment]::GetEnvironmentVariable\\(\"Path\",\"Machine\"\\) + \";\" + [System.Environment]::GetEnvironmentVariable\\(\"Path\",\"User\"\\); cd \"g:\\\\Proyecto_Final_DAM\"; Remove-Item -Recurse -Force venv -ErrorAction SilentlyContinue; python -m venv venv; Write-Host \"Venv creado\")"
+    ]
+  }
+}

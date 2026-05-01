@@ -33,10 +33,10 @@ class BBoxItem(QGraphicsRectItem):
 
     def _apply_style(self):
         color = QColor(self.bbox.label_class.color)
-        pen = QPen(color, 2)
+        pen = QPen(color, 1)
         self.setPen(pen)
         fill = QColor(color)
-        fill.setAlpha(40)
+        fill.setAlpha(55)
         self.setBrush(QBrush(fill))
 
     def update_class(self, new_class: LabelClass):
@@ -51,14 +51,14 @@ class BBoxItem(QGraphicsRectItem):
 
     def hoverEnterEvent(self, event):
         pen = self.pen()
-        pen.setWidth(3)
+        pen.setWidth(2)
         self.setPen(pen)
         self.setCursor(QCursor(Qt.CursorShape.SizeAllCursor))
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
         pen = self.pen()
-        pen.setWidth(2)
+        pen.setWidth(1)
         self.setPen(pen)
         self.unsetCursor()
         super().hoverLeaveEvent(event)
@@ -96,7 +96,7 @@ class AnnotationCanvas(QGraphicsView):
         self.setScene(self._scene)
 
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
 
@@ -110,6 +110,8 @@ class AnnotationCanvas(QGraphicsView):
         self._current_rect: QGraphicsRectItem | None = None
         self._active_class: LabelClass | None = None
         self._bbox_items: dict[str, BBoxItem] = {}
+        self._fit_zoom: float = 1.0   # zoom en el último fitInView
+        self._user_zoomed: bool = False
 
         self._scene.selectionChanged.connect(self._on_selection_changed)
 
@@ -127,7 +129,10 @@ class AnnotationCanvas(QGraphicsView):
         self._img_width = pixmap.width()
         self._img_height = pixmap.height()
         self._scene.setSceneRect(QRectF(pixmap.rect()))
-        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._user_zoomed = False
+        super().fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_zoom = self.transform().m11()
+        self.view_changed.emit()
         return True
 
     def set_draw_mode(self, enabled: bool):
@@ -173,11 +178,48 @@ class AnnotationCanvas(QGraphicsView):
             self._scene.removeItem(item)
         self._bbox_items.clear()
 
+    def clear_image(self):
+        """Elimina la imagen actual y resetea el estado visual del canvas."""
+        self._scene.clear()
+        self._bbox_items.clear()
+        self._pixmap_item = None
+        self._img_width = 0
+        self._img_height = 0
+        self._user_zoomed = False
+        self.resetTransform()
+        self._fit_zoom = 1.0
+        self.view_changed.emit()
+
     def get_image_size(self) -> tuple[int, int]:
         return self._img_width, self._img_height
 
     def has_image(self) -> bool:
         return self._pixmap_item is not None
+
+    def get_zoom_level(self) -> float:
+        """Devuelve el factor de escala actual (1.0 = 100%)."""
+        return self.transform().m11()
+
+    def set_zoom_level(self, factor: float):
+        """Establece un zoom absoluto sin acumular transformaciones."""
+        current = self.transform().m11()
+        if current > 0:
+            self.scale(factor / current, factor / current)
+
+    def get_viewport_normalized_rect(self) -> QRectF | None:
+        """Rectángulo del viewport en coordenadas normalizadas (0-1) respecto a la imagen."""
+        if not self._pixmap_item:
+            return None
+        scene_rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        img = self._scene.sceneRect()
+        if img.width() == 0 or img.height() == 0:
+            return None
+        return QRectF(
+            (scene_rect.x() - img.x()) / img.width(),
+            (scene_rect.y() - img.y()) / img.height(),
+            scene_rect.width()  / img.width(),
+            scene_rect.height() / img.height(),
+        )
 
     def get_item_viewport_top_center(self, item: BBoxItem) -> QPoint:
         scene_rect = item.sceneBoundingRect()
@@ -238,10 +280,34 @@ class AnnotationCanvas(QGraphicsView):
             super().mouseReleaseEvent(event)
             self.view_changed.emit()
 
+    def fit_view(self):
+        """Ajusta la vista a la imagen y marca que no hay zoom manual."""
+        if not self._pixmap_item:
+            return
+        self._user_zoomed = False
+        super().fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        self._fit_zoom = self.transform().m11()
+        self.view_changed.emit()
+
+    def get_fit_zoom(self) -> float:
+        return self._fit_zoom
+
+    def scale(self, sx: float, sy: float):
+        super().scale(sx, sy)
+        self._user_zoomed = True
+        self.view_changed.emit()
+
+    _MAX_ZOOM = 15.0   # 1500%
+
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        current = self.transform().m11()
+        new_zoom = current * factor
+        if new_zoom > self._MAX_ZOOM:
+            factor = self._MAX_ZOOM / current
+        elif new_zoom < self._fit_zoom:
+            factor = self._fit_zoom / current
         self.scale(factor, factor)
-        self.view_changed.emit()
 
     def scrollContentsBy(self, dx: int, dy: int):
         super().scrollContentsBy(dx, dy)
@@ -255,5 +321,7 @@ class AnnotationCanvas(QGraphicsView):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self._pixmap_item:
-            self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        if self._pixmap_item and not self._user_zoomed:
+            super().fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self._fit_zoom = self.transform().m11()
+            self.view_changed.emit()

@@ -2,7 +2,7 @@ import sys
 import logging
 from pathlib import Path
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QFont
 from app.main_window import MainWindow
 from app.project_selector import ProjectSelectorWindow
 from app.styles import DARK_THEME
@@ -23,6 +23,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("VisionHub Desktop")
     app.setOrganizationName("VisionHub")
+    app.setFont(QFont("Segoe UI", 10))
     app.setStyleSheet(DARK_THEME)
 
     selector = ProjectSelectorWindow()
