@@ -41,9 +41,12 @@ def _get_db_path() -> str:
             "La variable de entorno DB_PATH no está definida. "
             "Añádela en el archivo .env o en el entorno del sistema."
         )
-    # Asegura que el directorio destino exista
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    return db_path
+    # Resuelve siempre como ruta absoluta para evitar ambigüedad según CWD
+    abs_path = Path(db_path)
+    if not abs_path.is_absolute():
+        abs_path = (_ENV_PATH.parent / db_path).resolve()
+    abs_path.parent.mkdir(parents=True, exist_ok=True)
+    return str(abs_path)
 
 
 # ---------------------------------------------------------------------------
@@ -73,14 +76,17 @@ CREATE TABLE IF NOT EXISTS classes (
 
 _DDL_IMAGES = """
 CREATE TABLE IF NOT EXISTS images (
-    id          VARCHAR PRIMARY KEY,
-    project_id  VARCHAR NOT NULL REFERENCES projects(id),
-    file_path   VARCHAR NOT NULL,
-    split       VARCHAR DEFAULT 'train',
-    width       INTEGER,
-    height      INTEGER,
-    status      VARCHAR DEFAULT 'unannotated',
-    created_at  TIMESTAMP NOT NULL
+    id               VARCHAR PRIMARY KEY,
+    project_id       VARCHAR NOT NULL REFERENCES projects(id),
+    file_path        VARCHAR NOT NULL,
+    split            VARCHAR DEFAULT 'unassigned',
+    width            INTEGER,
+    height           INTEGER,
+    status           VARCHAR DEFAULT 'unannotated',
+    annotation_count INTEGER DEFAULT 0,
+    created_at       TIMESTAMP NOT NULL,
+    updated_at       TIMESTAMP NOT NULL,
+    UNIQUE (project_id, file_path)
 );
 """
 
@@ -181,6 +187,31 @@ class DatabaseManager:
             _DDL_TRAININGS,
         ):
             self.conn.execute(ddl)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Añade columnas nuevas y corrige constraints en tablas existentes."""
+        existing_cols = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'images'"
+            ).fetchall()
+        }
+        if 'annotation_count' not in existing_cols:
+            self.conn.execute(
+                "ALTER TABLE images ADD COLUMN annotation_count INTEGER DEFAULT 0"
+            )
+        if 'updated_at' not in existing_cols:
+            self.conn.execute(
+                "ALTER TABLE images ADD COLUMN updated_at TIMESTAMP"
+            )
+
+        # Eliminar el UNIQUE(file_path) incorrecto si existe — la misma imagen
+        # puede pertenecer a varios proyectos, el constraint correcto es (project_id, file_path)
+        try:
+            self.conn.execute("ALTER TABLE images DROP CONSTRAINT images_file_path_key")
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Operaciones de escritura — ImageAnnotation
@@ -310,3 +341,400 @@ class DatabaseManager:
             "width", "height", "status", "created_at",
         ]
         return [dict(zip(columns, row)) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Proyectos
+    # ------------------------------------------------------------------
+
+    def create_project(self, name: str, base_path: str, description: str = "") -> str:
+        """Crea un proyecto nuevo y devuelve su ID."""
+        import uuid as _uuid
+        project_id = str(_uuid.uuid4())
+        now = datetime.now(timezone.utc)
+        self.conn.execute(
+            """
+            INSERT INTO projects (id, name, description, base_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (project_id, name, description, base_path, now, now),
+        )
+        return project_id
+
+    def rename_project(self, project_id: str, new_name: str) -> None:
+        """Renombra un proyecto existente."""
+        now = datetime.now(timezone.utc)
+        self.conn.execute(
+            "UPDATE projects SET name = ?, updated_at = ? WHERE id = ?",
+            (new_name, now, project_id),
+        )
+
+    def create_training_run(
+        self,
+        *,
+        training_id: str,
+        project_id: str,
+        model_name: str,
+        dataset_yaml_path: str,
+        epochs: int,
+        image_size: int,
+        batch_size: int,
+        status: str = "running",
+    ) -> None:
+        """Crea un registro de entrenamiento en la tabla trainings."""
+        now = datetime.now(timezone.utc)
+        self.conn.execute(
+            """
+            INSERT INTO trainings
+                (id, project_id, model_name, dataset_yaml_path, epochs, image_size,
+                 batch_size, status, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                training_id,
+                project_id,
+                model_name,
+                dataset_yaml_path,
+                epochs,
+                image_size,
+                batch_size,
+                status,
+                now,
+            ),
+        )
+
+    def update_training_run(
+        self,
+        *,
+        training_id: str,
+        status: str,
+        metrics_path: str = "",
+        weights_path: str = "",
+    ) -> None:
+        """Actualiza el estado final de un entrenamiento."""
+        now = datetime.now(timezone.utc)
+        self.conn.execute(
+            """
+            UPDATE trainings
+            SET status = ?,
+                metrics_path = ?,
+                weights_path = ?,
+                finished_at = ?
+            WHERE id = ?
+            """,
+            (status, metrics_path, weights_path, now, training_id),
+        )
+
+    def get_all_projects_with_stats(self) -> list[dict]:
+        """Devuelve todos los proyectos con contadores de imágenes y anotaciones."""
+        rows = self.conn.execute(
+            """
+            SELECT
+                p.id, p.name, p.description, p.base_path,
+                p.created_at, p.updated_at,
+                COUNT(DISTINCT i.id)                          AS image_count,
+                COALESCE(SUM(i.annotation_count), 0)          AS annotation_count,
+                MAX(i.updated_at)                             AS last_activity,
+                MIN(i.file_path)                              AS sample_image
+            FROM projects p
+            LEFT JOIN images i ON i.project_id = p.id
+            GROUP BY p.id, p.name, p.description, p.base_path, p.created_at, p.updated_at
+            ORDER BY COALESCE(MAX(i.updated_at), p.updated_at) DESC
+            """
+        ).fetchall()
+        keys = [
+            "id", "name", "description", "base_path",
+            "created_at", "updated_at",
+            "image_count", "annotation_count", "last_activity", "sample_image",
+        ]
+        return [dict(zip(keys, r)) for r in rows]
+
+    def delete_project_cascade(self, project_id: str) -> dict:
+        """Elimina un proyecto y todos sus datos asociados.
+
+        Borra en cascada lógica:
+        - annotations (de imágenes del proyecto y clases del proyecto)
+        - trainings del proyecto
+        - images del proyecto
+        - classes del proyecto
+        - projects (fila del proyecto)
+
+        Returns:
+            Resumen con contadores de filas eliminadas.
+        """
+        summary = {
+            "annotations": 0,
+            "trainings": 0,
+            "images": 0,
+            "classes": 0,
+            "projects": 0,
+        }
+
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            summary["annotations"] = self.conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM annotations a
+                WHERE a.image_id IN (SELECT id FROM images WHERE project_id = ?)
+                   OR a.class_id IN (SELECT id FROM classes WHERE project_id = ?)
+                """,
+                (project_id, project_id),
+            ).fetchone()[0]
+            summary["trainings"] = self.conn.execute(
+                "SELECT COUNT(*) FROM trainings WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0]
+            summary["images"] = self.conn.execute(
+                "SELECT COUNT(*) FROM images WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0]
+            summary["classes"] = self.conn.execute(
+                "SELECT COUNT(*) FROM classes WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0]
+            summary["projects"] = self.conn.execute(
+                "SELECT COUNT(*) FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()[0]
+
+            # IDs del proyecto a borrar (reutilizados en toda la cascada)
+            image_ids = [
+                r[0]
+                for r in self.conn.execute(
+                    "SELECT id FROM images WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            ]
+            class_ids = [
+                r[0]
+                for r in self.conn.execute(
+                    "SELECT id FROM classes WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            ]
+
+            # 1) Limpieza directa de tablas conocidas
+            self.conn.execute(
+                """
+                DELETE FROM annotations
+                WHERE image_id IN (SELECT id FROM images WHERE project_id = ?)
+                   OR class_id IN (SELECT id FROM classes WHERE project_id = ?)
+                """,
+                (project_id, project_id),
+            )
+
+            # 2) Limpieza defensiva por FKs reales del esquema.
+            #    Si existen tablas adicionales que referencian images/classes/projects,
+            #    se limpian automáticamente antes de borrar los padres.
+            try:
+                fk_rows = self.conn.execute(
+                    """
+                    SELECT
+                        tc.table_name AS child_table,
+                        kcu.column_name AS child_column,
+                        ccu.table_name AS parent_table,
+                        ccu.column_name AS parent_column
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_name = kcu.table_name
+                    JOIN information_schema.constraint_column_usage ccu
+                      ON tc.constraint_name = ccu.constraint_name
+                    WHERE tc.constraint_type = 'FOREIGN KEY'
+                      AND ccu.table_name IN ('images', 'classes', 'projects')
+                    ORDER BY child_table
+                    """
+                ).fetchall()
+
+                for child_table, child_column, parent_table, parent_column in fk_rows:
+                    if child_table in ("annotations", "trainings", "images", "classes", "projects"):
+                        continue
+
+                    if parent_table == "images" and parent_column == "id":
+                        self.conn.execute(
+                            f"""
+                            DELETE FROM {child_table}
+                            WHERE {child_column} IN (
+                                SELECT id FROM images WHERE project_id = ?
+                            )
+                            """,
+                            (project_id,),
+                        )
+                    elif parent_table == "classes" and parent_column == "id":
+                        self.conn.execute(
+                            f"""
+                            DELETE FROM {child_table}
+                            WHERE {child_column} IN (
+                                SELECT id FROM classes WHERE project_id = ?
+                            )
+                            """,
+                            (project_id,),
+                        )
+                    elif parent_table == "projects" and parent_column == "id":
+                        self.conn.execute(
+                            f"DELETE FROM {child_table} WHERE {child_column} = ?",
+                            (project_id,),
+                        )
+            except Exception:
+                # Compatibilidad con versiones de DuckDB sin information_schema.table_constraints.
+                image_ref_tables = [
+                    r[0]
+                    for r in self.conn.execute(
+                        """
+                        SELECT DISTINCT table_name
+                        FROM information_schema.columns
+                        WHERE column_name = 'image_id'
+                          AND table_name NOT IN ('annotations', 'images', 'classes', 'projects', 'trainings')
+                        """
+                    ).fetchall()
+                ]
+                for table_name in image_ref_tables:
+                    self.conn.execute(
+                        f"DELETE FROM {table_name} WHERE image_id IN (SELECT id FROM images WHERE project_id = ?)",
+                        (project_id,),
+                    )
+
+                class_ref_tables = [
+                    r[0]
+                    for r in self.conn.execute(
+                        """
+                        SELECT DISTINCT table_name
+                        FROM information_schema.columns
+                        WHERE column_name = 'class_id'
+                          AND table_name NOT IN ('annotations', 'images', 'classes', 'projects', 'trainings')
+                        """
+                    ).fetchall()
+                ]
+                for table_name in class_ref_tables:
+                    self.conn.execute(
+                        f"DELETE FROM {table_name} WHERE class_id IN (SELECT id FROM classes WHERE project_id = ?)",
+                        (project_id,),
+                    )
+
+                project_ref_tables = [
+                    r[0]
+                    for r in self.conn.execute(
+                        """
+                        SELECT DISTINCT table_name
+                        FROM information_schema.columns
+                        WHERE column_name = 'project_id'
+                          AND table_name NOT IN ('images', 'classes', 'projects', 'trainings')
+                        """
+                    ).fetchall()
+                ]
+                for table_name in project_ref_tables:
+                    self.conn.execute(
+                        f"DELETE FROM {table_name} WHERE project_id = ?",
+                        (project_id,),
+                    )
+
+            # 3) Último barrido defensivo:
+            #    elimina referencias por columnas image_id/class_id en cualquier tabla
+            #    visible del esquema (excepto tablas base ya tratadas).
+            #    Esto cubre esquemas legacy o tablas auxiliares no contempladas.
+            tables = [
+                r[0]
+                for r in self.conn.execute(
+                    """
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'main'
+                    """
+                ).fetchall()
+            ]
+            excluded = {"images", "classes", "projects", "annotations", "trainings"}
+            target_tables = [t for t in tables if t not in excluded]
+
+            for table_name in target_tables:
+                cols = {
+                    r[0]
+                    for r in self.conn.execute(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_name = ?
+                        """,
+                        (table_name,),
+                    ).fetchall()
+                }
+                if "image_id" in cols and image_ids:
+                    for img_id in image_ids:
+                        self.conn.execute(
+                            f"DELETE FROM {table_name} WHERE image_id = ?",
+                            (img_id,),
+                        )
+                if "class_id" in cols and class_ids:
+                    for cls_id in class_ids:
+                        self.conn.execute(
+                            f"DELETE FROM {table_name} WHERE class_id = ?",
+                            (cls_id,),
+                        )
+                if "project_id" in cols:
+                    self.conn.execute(
+                        f"DELETE FROM {table_name} WHERE project_id = ?",
+                        (project_id,),
+                    )
+
+            self.conn.execute("DELETE FROM trainings WHERE project_id = ?", (project_id,))
+            self.conn.execute("DELETE FROM images WHERE project_id = ?", (project_id,))
+            self.conn.execute("DELETE FROM classes WHERE project_id = ?", (project_id,))
+            self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+        return summary
+
+    def load_annotations_for_project(self, project_id: str) -> dict:
+        """Reconstruye los ImageAnnotation de un proyecto desde la BD.
+
+        Returns:
+            dict[image_path, ImageAnnotation]
+        """
+        from app.annotation import BoundingBox, ImageAnnotation, LabelClass
+
+        class_rows = self.conn.execute(
+            "SELECT id, name, color, yolo_index FROM classes WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+        class_map = {r[0]: LabelClass(name=r[1], color=r[2], class_id=r[3]) for r in class_rows}
+
+        image_rows = self.conn.execute(
+            "SELECT id, file_path, width, height FROM images WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+
+        result: dict = {}
+        for img_id, file_path, width, height in image_rows:
+            if not width or not height:
+                continue
+            ann_rows = self.conn.execute(
+                """
+                SELECT id, class_id, x_center, y_center, width, height
+                FROM annotations WHERE image_id = ?
+                """,
+                (img_id,),
+            ).fetchall()
+            boxes = []
+            for ann_id, class_id, xc, yc, bw, bh in ann_rows:
+                cls = class_map.get(class_id)
+                if not cls:
+                    continue
+                boxes.append(BoundingBox(
+                    x=(xc - bw / 2) * width,
+                    y=(yc - bh / 2) * height,
+                    width=bw * width,
+                    height=bh * height,
+                    label_class=cls,
+                    id=ann_id,
+                ))
+            if boxes:
+                result[file_path] = ImageAnnotation(
+                    image_path=file_path,
+                    image_width=width,
+                    image_height=height,
+                    boxes=boxes,
+                )
+        return result

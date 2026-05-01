@@ -1,5 +1,8 @@
 from __future__ import annotations
+import logging
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -304,9 +307,19 @@ class ClassListItem(QListWidgetItem):
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    back_to_projects = pyqtSignal()
+
+    def __init__(
+        self,
+        db: "DatabaseManager | None" = None,
+        project_id: str | None = None,
+        base_path: str | None = None,
+        project_name: str | None = None,
+    ):
         super().__init__()
-        self.setWindowTitle("VisionHub Desktop — MVP Etiquetado")
+        self.setWindowTitle(
+            f"VisionHub — {project_name}" if project_name else "VisionHub Desktop"
+        )
         self.setMinimumSize(1280, 720)
         self.resize(1500, 900)
 
@@ -317,18 +330,31 @@ class MainWindow(QMainWindow):
         self._selected_item: BBoxItem | None = None
         self._next_color_index = 0
 
-        # [DB] Inicializar base de datos y crear tablas si no existen
-        self._db = DatabaseManager()
+        # [DB] Usar la conexión compartida del selector o abrir una nueva
+        self._db = db if db is not None else DatabaseManager()
         self._db.initialize_tables()
-        # [DB] Sembrar proyecto y clases por defecto al arrancar
-        self._db_seed_default_project()
+
+        # ID del proyecto activo — viene del selector o usa el seed por defecto
+        if project_id:
+            self._PROJECT_ID = project_id
+        else:
+            self._db_seed_default_project()
 
         self._build_ui()
         self._overlay = BBoxOverlay(self.canvas.viewport())
         self._connect_signals()
-        # [DB] Cargar clases de la BD en el panel lateral (sincronización inicial)
         self._db_load_classes_into_ui()
         self._update_ui_state()
+
+        # Auto-cargar imágenes y anotaciones si viene del selector
+        if project_id:
+            self._load_project_from_db(project_id, base_path or "")
+
+    def _log_db_error(self, msg: str, exc: Exception) -> None:
+        """Muestra el error en la barra de estado Y lo registra en el archivo de log."""
+        full = f"⚠ {msg}: {exc}"
+        self.status_bar.showMessage(full)
+        _log.error(full, exc_info=exc)
 
     # ------------------------------------------------------------------ #
     # UI
@@ -340,6 +366,17 @@ class MainWindow(QMainWindow):
         toolbar.setIconSize(QSize(18, 18))
         toolbar.setStyleSheet("QToolBar { spacing: 4px; padding: 4px 8px; }")
         self.addToolBar(toolbar)
+
+        # — Volver al selector —
+        self.btn_back = QPushButton("← Proyectos")
+        self.btn_back.setStyleSheet(
+            "QPushButton { background: transparent; color: #6c7086; border: none; "
+            "font-size: 12px; padding: 0 8px; }"
+            "QPushButton:hover { color: #89b4fa; }"
+        )
+        self.btn_back.clicked.connect(self.back_to_projects)
+        toolbar.addWidget(self.btn_back)
+        toolbar.addSeparator()
 
         # — Abrir —
         self.btn_open_image = QPushButton("Cargar imagen")
@@ -438,7 +475,7 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self.analytics_page)
 
         # Página 2 — Train
-        self.train_page = TrainWidget()
+        self.train_page = TrainWidget(db=self._db, project_id=self._PROJECT_ID)
         self._stack.addWidget(self.train_page)
 
         # Página 3 — Inference
@@ -640,6 +677,9 @@ class MainWindow(QMainWindow):
 
         self.gallery.image_selected.connect(self._on_gallery_image_selected)
 
+        self.train_page.dataset_export_requested.connect(self._on_export_dataset)
+        self.gallery.split_changed.connect(self._on_split_changed)
+
         self.canvas.box_created.connect(self._on_box_created)
         self.canvas.box_deleted.connect(self._on_box_deleted)
         self.canvas.box_selected.connect(self._on_box_selected)
@@ -734,10 +774,10 @@ class MainWindow(QMainWindow):
         import uuid
         from datetime import datetime, timezone
 
-        # [DB] Buscar por ruta de archivo (clave de negocio)
+        # [DB] Buscar por proyecto + ruta (esquema actual esperado)
         row = self._db.conn.execute(
-            "SELECT id FROM images WHERE file_path = ?",
-            (image_path,),
+            "SELECT id FROM images WHERE file_path = ? AND project_id = ?",
+            (image_path, self._PROJECT_ID),
         ).fetchone()
 
         if row is not None:
@@ -745,24 +785,53 @@ class MainWindow(QMainWindow):
 
         # [DB] No existe → insertar nueva fila
         new_id = str(uuid.uuid4())
-        self._db.conn.execute(
-            """
-            INSERT INTO images
-                (id, project_id, file_path, split, width, height, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                new_id,
-                self._PROJECT_ID,   # [DB] 'animales' — consistente con el proyecto
-                image_path,
-                "train",            # split por defecto
-                width,
-                height,
-                "annotated",
-                datetime.now(timezone.utc),
-            ),
-        )
-        return new_id
+        now = datetime.now(timezone.utc)
+        try:
+            self._db.conn.execute(
+                """
+                INSERT INTO images
+                    (id, project_id, file_path, split, width, height,
+                     status, annotation_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (new_id, self._PROJECT_ID, image_path,
+                 "unassigned", width, height, "unannotated", 0, now, now),
+            )
+            return new_id
+        except Exception as e:
+            # Compatibilidad con BDs antiguas que aún puedan tener UNIQUE(file_path).
+            # En ese caso, recuperamos la fila existente por ruta y evitamos romper la navegación.
+            msg = str(e).lower()
+            if "duplicate key" in msg and "file_path" in msg:
+                existing_same_project = self._db.conn.execute(
+                    "SELECT id FROM images WHERE file_path = ? AND project_id = ?",
+                    (image_path, self._PROJECT_ID),
+                ).fetchone()
+                if existing_same_project is not None:
+                    self._db.conn.execute(
+                        """
+                        UPDATE images
+                        SET width = COALESCE(width, ?),
+                            height = COALESCE(height, ?),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (width, height, now, existing_same_project[0]),
+                    )
+                    return existing_same_project[0]
+
+                # Si existe en otro proyecto, NO reutilizar para evitar mezclar datos.
+                existing_other_project = self._db.conn.execute(
+                    "SELECT id, project_id FROM images WHERE file_path = ?",
+                    (image_path,),
+                ).fetchone()
+                if existing_other_project is not None:
+                    raise RuntimeError(
+                        "Conflicto de imagen: la ruta ya existe asociada a otro proyecto "
+                        f"('{existing_other_project[1]}'). "
+                        "Esta base de datos parece usar una restricción antigua UNIQUE(file_path)."
+                    ) from e
+            raise
 
     def _db_resolve_class_uuid(
         self,
@@ -875,6 +944,54 @@ class MainWindow(QMainWindow):
     # Abrir imagen / carpeta
     # ------------------------------------------------------------------ #
 
+    def _load_project_from_db(self, project_id: str, base_path: str) -> None:
+        """Carga imágenes de la BD y, como apoyo, de base_path si existe."""
+        from app.project import Project, SUPPORTED_EXTENSIONS
+        from datetime import datetime, timezone
+
+        # 1) Fuente principal: imágenes ya registradas en BD para el proyecto
+        rows = self._db.conn.execute(
+            "SELECT file_path FROM images WHERE project_id = ? ORDER BY file_path",
+            (project_id,),
+        ).fetchall()
+        images_from_db = [r[0] for r in rows if r and r[0] and Path(r[0]).exists()]
+
+        # 2) Fuente secundaria: carpeta base_path (si existe)
+        images_from_folder: list[str] = []
+        if base_path and Path(base_path).exists():
+            images_from_folder = sorted([
+                str(f) for f in Path(base_path).iterdir()
+                if f.suffix.lower() in SUPPORTED_EXTENSIONS
+            ])
+
+        # 3) Unir ambas fuentes sin duplicados
+        images = sorted(set(images_from_db + images_from_folder))
+        if not images:
+            self.status_bar.showMessage(
+                "El proyecto no tiene imágenes accesibles. "
+                "Carga imágenes desde la galería para comenzar."
+            )
+            return
+
+        project = Project(folder=base_path, image_paths=images)
+
+        # Cargar anotaciones desde BD
+        project.annotations = self._db.load_annotations_for_project(project_id)
+
+        # Actualizar base_path en la BD
+        try:
+            from datetime import datetime, timezone
+            self._db.conn.execute(
+                "UPDATE projects SET base_path = ?, updated_at = ? WHERE id = ?",
+                (base_path, datetime.now(timezone.utc), project_id),
+            )
+        except Exception:
+            pass
+
+        self._load_project(project)
+        if images:
+            self._navigate_to(images[0], save_current=False)
+
     def _on_open_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Cargar imagen", "",
@@ -927,9 +1044,35 @@ class MainWindow(QMainWindow):
         for img_path, ann in self._project.annotations.items():
             if ann.boxes:
                 self.gallery.update_badge(img_path, len(ann.boxes))
+        self._db_load_gallery_splits()
         self.lbl_gallery_count.setText(f"{self._project.image_count} img")
         self._update_ui_state()
         return len(new)
+
+    def _on_split_changed(self, image_path: str, split: str) -> None:
+        """Persiste el split asignado por el usuario en la BD y actualiza la galería."""
+        from datetime import datetime, timezone
+        try:
+            self._db.conn.execute(
+                "UPDATE images SET split = ?, updated_at = ? WHERE file_path = ?",
+                (split, datetime.now(timezone.utc), image_path),
+            )
+            self.gallery.update_split(image_path, split)
+        except Exception as e:
+            self._log_db_error("Error al asignar split", e)
+
+    def _db_load_gallery_splits(self) -> None:
+        """Lee los splits de la BD y los refleja en la galería."""
+        try:
+            rows = self._db.conn.execute(
+                "SELECT file_path, split FROM images WHERE project_id = ?",
+                (self._PROJECT_ID,),
+            ).fetchall()
+            for file_path, split in rows:
+                if split and split != 'unassigned':
+                    self.gallery.update_split(file_path, split)
+        except Exception:
+            pass
 
     def _load_project(self, project: Project):
         self._project = project
@@ -941,6 +1084,7 @@ class MainWindow(QMainWindow):
         for img_path, ann in project.annotations.items():
             if ann.boxes:
                 self.gallery.update_badge(img_path, len(ann.boxes))
+        self._db_load_gallery_splits()
 
         self.lbl_gallery_count.setText(f"{project.image_count} img")
         self._update_ui_state()
@@ -1180,24 +1324,54 @@ class MainWindow(QMainWindow):
             )
         except Exception as exc:
             # No interrumpimos el flujo de UI por un error de BD; sí lo notificamos
-            self.status_bar.showMessage(f"⚠ Error al guardar en BD: {exc}")
+            self._log_db_error("Error al guardar en BD", exc)
+
+    def _db_update_image_status(self, image_path: str, delta: int) -> None:
+        """Actualiza annotation_count, status y updated_at en la tabla images."""
+        from datetime import datetime, timezone
+        try:
+            self._db.conn.execute(
+                """
+                UPDATE images
+                SET annotation_count = CASE
+                        WHEN annotation_count + ? < 0 THEN 0
+                        ELSE annotation_count + ?
+                    END,
+                    updated_at = ?
+                WHERE file_path = ?
+                """,
+                (delta, delta, datetime.now(timezone.utc), image_path),
+            )
+            self._db.conn.execute(
+                """
+                UPDATE images
+                SET status = CASE
+                        WHEN annotation_count > 0 THEN 'annotated'
+                        ELSE 'unannotated'
+                    END
+                WHERE file_path = ?
+                """,
+                (image_path,),
+            )
+        except Exception as e:
+            self._log_db_error("Error al actualizar estado en BD", e)
 
     def _on_box_created(self, bbox: BoundingBox):
         if self._annotation:
             self._annotation.add_box(bbox)
             self._refresh_box_count()
-            # [DB] Persistencia inmediata tras crear un bbox
             self._db_persist_current_annotation()
+            self._db_update_image_status(self._current_image_path, +1)
 
     def _on_box_deleted(self, box_id: str):
         if self._annotation:
             self._annotation.remove_box(box_id)
             self._refresh_box_count()
-            # [DB] Borrar explícitamente el bbox de la BD
             try:
                 self._db.conn.execute("DELETE FROM annotations WHERE id = ?", (box_id,))
             except Exception as e:
-                self.status_bar.showMessage(f"⚠ Error al borrar en BD: {e}")
+                self._log_db_error("Error al borrar en BD", e)
+            self._db_update_image_status(self._current_image_path, -1)
 
     def _on_clear_all(self):
         if not self._annotation:
@@ -1207,12 +1381,16 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            # [DB] Borrar explícitamente los bboxes actuales de la BD
+            from datetime import datetime, timezone
             try:
                 for box in self._annotation.boxes:
                     self._db.conn.execute("DELETE FROM annotations WHERE id = ?", (box.id,))
+                self._db.conn.execute(
+                    "UPDATE images SET annotation_count = 0, status = 'unannotated', updated_at = ? WHERE file_path = ?",
+                    (datetime.now(timezone.utc), self._current_image_path),
+                )
             except Exception as e:
-                self.status_bar.showMessage(f"⚠ Error al borrar en BD: {e}")
+                self._log_db_error("Error al borrar en BD", e)
 
             self._overlay.hide()
             self._selected_item = None
@@ -1383,6 +1561,60 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
+    def _on_export_dataset(self):
+        """Genera el dataset completo (images/, labels/, data.yaml) y carga el yaml en TrainWidget."""
+        if not self._project:
+            QMessageBox.warning(self, "Sin proyecto", "Abre un proyecto con imágenes primero.")
+            return
+
+        annotated_count = sum(1 for ann in self._project.annotations.values() if ann.boxes)
+        if annotated_count == 0:
+            QMessageBox.warning(self, "Sin anotaciones", "No hay imágenes anotadas para exportar.")
+            return
+
+        output_dir = QFileDialog.getExistingDirectory(self, "Carpeta de destino del dataset")
+        if not output_dir:
+            return
+
+        try:
+            # Leer splits asignados por el usuario desde la BD
+            rows = self._db.conn.execute(
+                "SELECT file_path, split FROM images WHERE project_id = ?",
+                (self._PROJECT_ID,),
+            ).fetchall()
+            splits_from_db = {r[0]: r[1] for r in rows}
+
+            yaml_path, final_splits = YoloExporter.export_dataset(
+                annotations=self._project.annotations,
+                classes=self._classes,
+                output_dir=output_dir,
+                splits=splits_from_db,
+            )
+
+            # Persistir los splits definitivos (incluyendo los auto-asignados)
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc)
+            for img_path, split in final_splits.items():
+                self._db.conn.execute(
+                    "UPDATE images SET split = ?, updated_at = ? WHERE file_path = ?",
+                    (split, now, img_path),
+                )
+                self.gallery.update_split(img_path, split)
+
+            train_count = sum(1 for s in final_splits.values() if s == 'train')
+            val_count   = sum(1 for s in final_splits.values() if s == 'val')
+
+            self.train_page.set_yaml(yaml_path)
+            QMessageBox.information(
+                self, "Dataset generado",
+                f"Dataset listo en:\n{output_dir}\n\n"
+                f"Train: {train_count} imágenes\n"
+                f"Val:   {val_count} imágenes\n\n"
+                f"El data.yaml se ha cargado en el panel de entrenamiento.",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error al exportar dataset", str(e))
+
     # ------------------------------------------------------------------ #
     # Zoom
     # ------------------------------------------------------------------ #
@@ -1456,6 +1688,7 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self.inference_page.stop_camera()
         if self._project:
             self._commit_current_annotation()
             self._project.classes = self._classes

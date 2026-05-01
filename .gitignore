@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
 .venv/
+venv/
 .env
 *.db
 *.pt
 datasets/
+data/
+app/.claude/
+visionhub_project.json

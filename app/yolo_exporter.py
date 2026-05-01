@@ -1,7 +1,9 @@
 from __future__ import annotations
 import os
+import random
+import shutil
 from pathlib import Path
-from app.annotation import ImageAnnotation
+from app.annotation import ImageAnnotation, LabelClass
 
 
 class YoloExporter:
@@ -44,3 +46,72 @@ class YoloExporter:
         out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         return str(out_path)
+
+    @staticmethod
+    def export_dataset(
+        annotations: dict[str, ImageAnnotation],
+        classes: list[LabelClass],
+        output_dir: str,
+        splits: dict[str, str] | None = None,
+        val_ratio: float = 0.2,
+    ) -> tuple[str, dict[str, str]]:
+        """Genera la estructura de dataset completa para YOLOv8/YOLO11.
+
+        Crea images/train, images/val, labels/train, labels/val y data.yaml.
+
+        Args:
+            splits:    Mapa image_path → 'train'|'val'|'unassigned' desde la BD.
+                       Las imágenes 'unassigned' se distribuyen automáticamente.
+        Returns:
+            (yaml_path, final_splits) — yaml generado y splits definitivos usados.
+        """
+        annotated = [p for p, ann in annotations.items() if ann.boxes]
+        if not annotated:
+            raise ValueError("No hay imágenes anotadas para exportar.")
+
+        output = Path(output_dir)
+        for split in ("train", "val"):
+            (output / "images" / split).mkdir(parents=True, exist_ok=True)
+            (output / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+        # Separar imágenes ya asignadas de las que hay que distribuir
+        final_splits: dict[str, str] = {}
+        unassigned: list[str] = []
+
+        for img_path in annotated:
+            assigned = (splits or {}).get(img_path, 'unassigned')
+            if assigned in ('train', 'val'):
+                final_splits[img_path] = assigned
+            else:
+                unassigned.append(img_path)
+
+        # Distribuir las no asignadas con ratio val_ratio
+        if unassigned:
+            random.shuffle(unassigned)
+            val_count = max(1, int(len(unassigned) * val_ratio)) if len(unassigned) > 1 else 0
+            for i, img_path in enumerate(unassigned):
+                final_splits[img_path] = 'val' if i < val_count else 'train'
+
+        for img_path, split in final_splits.items():
+            src = Path(img_path)
+            shutil.copy2(src, output / "images" / split / src.name)
+            lbl_path = output / "labels" / split / src.with_suffix(".txt").name
+            lbl_path.write_text(
+                "\n".join(annotations[img_path].to_yolo_lines()) + "\n",
+                encoding="utf-8",
+            )
+
+        sorted_classes = sorted(classes, key=lambda c: c.class_id)
+        names_block = "\n".join(f"  - {c.name}" for c in sorted_classes)
+        yaml_content = (
+            f"path: {output.resolve()}\n"
+            f"train: images/train\n"
+            f"val: images/val\n"
+            f"\n"
+            f"nc: {len(sorted_classes)}\n"
+            f"names:\n{names_block}\n"
+        )
+
+        yaml_path = output / "data.yaml"
+        yaml_path.write_text(yaml_content, encoding="utf-8")
+        return str(yaml_path), final_splits
