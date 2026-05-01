@@ -1,8 +1,8 @@
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame, QGridLayout
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame, QGridLayout, QComboBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 
 from app.database import DatabaseManager
@@ -14,7 +14,9 @@ class AnalyticsWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.project_id = project_id
+        self.bar_item = None
         self._build_ui()
+        self._populate_filters()
         self.refresh_data()
 
     def _build_ui(self):
@@ -35,6 +37,29 @@ class AnalyticsWidget(QWidget):
         
         layout.addLayout(header)
 
+        # Filtros
+        filters_frame = QFrame()
+        filters_frame.setStyleSheet("background: #1e1e2e; border-radius: 8px;")
+        filters_layout = QHBoxLayout(filters_frame)
+        
+        lbl_proj = QLabel("Proyecto:")
+        lbl_proj.setStyleSheet("color: #cdd6f4; font-weight: bold;")
+        self.combo_project = QComboBox()
+        
+        lbl_class = QLabel("Clase:")
+        lbl_class.setStyleSheet("color: #cdd6f4; font-weight: bold;")
+        self.combo_class = QComboBox()
+        
+        lbl_status = QLabel("Estado:")
+        lbl_status.setStyleSheet("color: #cdd6f4; font-weight: bold;")
+        self.combo_status = QComboBox()
+        
+        for w in (lbl_proj, self.combo_project, lbl_class, self.combo_class, lbl_status, self.combo_status):
+            filters_layout.addWidget(w)
+        filters_layout.addStretch()
+        
+        layout.addWidget(filters_frame)
+
         # Grid for charts
         grid = QGridLayout()
         grid.setSpacing(20)
@@ -43,6 +68,30 @@ class AnalyticsWidget(QWidget):
         self.plot_top_classes = pg.PlotWidget(title="Top 10 Clases")
         self.plot_top_classes.setBackground("#1e1e2e")
         self.plot_top_classes.setTitle("Distribución de Clases (Top 10)", color="#cdd6f4")
+        self.plot_top_classes.setYRange(0, 300)
+        
+        # Franjas de "Salud del Dataset"
+        def add_region(y_min, y_max, color):
+            region = pg.LinearRegionItem([y_min, y_max], orientation='horizontal', movable=False)
+            region.setBrush(pg.mkBrush(color))
+            region.setHoverBrush(pg.mkBrush(color))
+            for line in region.lines:
+                line.setPen(pg.mkPen(None))
+                line.setHoverPen(pg.mkPen(None))
+            region.setZValue(-10)
+            self.plot_top_classes.addItem(region)
+            
+        add_region(0, 50, (255, 0, 0, 30))      # Roja
+        add_region(50, 100, (255, 255, 0, 30))  # Amarilla
+        add_region(100, 200, (0, 255, 0, 30))   # Verde
+        add_region(200, 300, (0, 0, 255, 30))   # Azul
+        
+        # Líneas y Límites
+        line50 = pg.InfiniteLine(pos=50, angle=0, pen=pg.mkPen('y', style=Qt.PenStyle.DashLine))
+        self.plot_top_classes.addItem(line50)
+        line200 = pg.InfiniteLine(pos=200, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine))
+        self.plot_top_classes.addItem(line200)
+
         grid.addWidget(self.plot_top_classes, 0, 0)
 
         # 2. Evolution (Line Chart)
@@ -65,48 +114,155 @@ class AnalyticsWidget(QWidget):
         layout.addLayout(grid)
         layout.setStretchFactor(grid, 1)
 
+    def _populate_filters(self):
+        # Desactivar señales temporalmente
+        self.combo_project.blockSignals(True)
+        self.combo_class.blockSignals(True)
+        self.combo_status.blockSignals(True)
+
+        # Proyectos
+        self.combo_project.clear()
+        projects = self.db.conn.execute("SELECT id, name FROM projects").fetchall()
+        for p_id, p_name in projects:
+            self.combo_project.addItem(p_name, p_id)
+            if p_id == self.project_id:
+                self.combo_project.setCurrentIndex(self.combo_project.count() - 1)
+
+        # Clases
+        self.combo_class.clear()
+        self.combo_class.addItem("Todos", None)
+        classes = self.db.conn.execute("SELECT id, name FROM classes WHERE project_id = ?", (self.project_id,)).fetchall()
+        for c_id, c_name in classes:
+            self.combo_class.addItem(c_name, c_id)
+
+        # Estado
+        self.combo_status.clear()
+        self.combo_status.addItems(["annotated", "train", "test", "val"])
+        self.combo_status.setCurrentText("annotated")
+
+        # Reactivar señales y conectar a la función central
+        self.combo_project.blockSignals(False)
+        self.combo_class.blockSignals(False)
+        self.combo_status.blockSignals(False)
+
+        self.combo_project.currentIndexChanged.connect(self._on_filter_changed)
+        self.combo_class.currentIndexChanged.connect(self._on_filter_changed)
+        self.combo_status.currentIndexChanged.connect(self._on_filter_changed)
+
+    def _on_filter_changed(self):
+        new_project_id = self.combo_project.currentData()
+        if new_project_id and new_project_id != self.project_id:
+            self.project_id = new_project_id
+            self.combo_class.blockSignals(True)
+            self.combo_class.clear()
+            self.combo_class.addItem("Todos", None)
+            classes = self.db.conn.execute("SELECT id, name FROM classes WHERE project_id = ?", (self.project_id,)).fetchall()
+            for c_id, c_name in classes:
+                self.combo_class.addItem(c_name, c_id)
+            self.combo_class.blockSignals(False)
+            
+        self.refresh_data()
+
     def refresh_data(self):
         self._update_top_classes()
         self._update_evolution()
         self._update_stats()
 
     def _update_stats(self):
-        # Total images
-        row_img = self.db.conn.execute(
-            "SELECT COUNT(*) FROM images WHERE project_id = ?",
-            (self.project_id,)
-        ).fetchone()
+        filters_img = ""
+        params_img = [self.project_id]
+
+        estado = self.combo_status.currentText()
+        if estado == "annotated":
+            filters_img += " AND status = 'annotated'"
+        elif estado in ["train", "test", "val"]:
+            filters_img += " AND dataset_type = ?"
+            params_img.append(estado)
+
+        filters_boxes = ""
+        params_boxes = [self.project_id]
         
-        # Total boxes
+        if estado == "annotated":
+            filters_boxes += " AND i.status = 'annotated'"
+        elif estado in ["train", "test", "val"]:
+            filters_boxes += " AND i.dataset_type = ?"
+            params_boxes.append(estado)
+            
+        clase_id = self.combo_class.currentData()
+        if clase_id is not None:
+            filters_boxes += " AND a.class_id = ?"
+            params_boxes.append(clase_id)
+            
         row_boxes = self.db.conn.execute(
-            """
-            SELECT COUNT(*) FROM annotations a 
+            f"""
+            SELECT COUNT(a.id) FROM annotations a 
             JOIN images i ON a.image_id = i.id 
-            WHERE i.project_id = ?
+            WHERE i.project_id = ? {filters_boxes}
             """,
-            (self.project_id,)
+            params_boxes
         ).fetchone()
-        
+
+        if clase_id is not None:
+            query_img = f"""
+                SELECT COUNT(DISTINCT i.id) 
+                FROM images i
+                JOIN annotations a ON a.image_id = i.id
+                WHERE i.project_id = ? {filters_boxes}
+            """
+            row_img = self.db.conn.execute(query_img, params_boxes).fetchone()
+        else:
+            query_img = f"""
+                SELECT COUNT(id) FROM images 
+                WHERE project_id = ? {filters_img}
+            """
+            row_img = self.db.conn.execute(query_img, params_img).fetchone()
+            
         self.lbl_total_images.setText(f"Total Imágenes: {row_img[0] if row_img else 0}")
         self.lbl_total_boxes.setText(f"Total Anotaciones: {row_boxes[0] if row_boxes else 0}")
 
     def _update_top_classes(self):
-        self.plot_top_classes.clear()
+        if hasattr(self, 'bar_item') and self.bar_item is not None:
+            self.plot_top_classes.removeItem(self.bar_item)
+            self.bar_item = None
+            
+        image_filters = ""
+        params = [self.project_id]
+
+        estado = self.combo_status.currentText()
+        if estado == "annotated":
+            image_filters += " AND i.status = 'annotated'"
+        elif estado in ["train", "test", "val"]:
+            image_filters += " AND i.dataset_type = ?"
+            params.append(estado)
+
+        class_filters = ""
+        clase_id = self.combo_class.currentData()
+        if clase_id is not None:
+            class_filters += " AND c.id = ?"
+            params.append(clase_id)
+
+        params.append(self.project_id)
         
-        rows = self.db.conn.execute(
-            """
+        query = f"""
             SELECT c.name, COUNT(a.id) as count, c.color
             FROM classes c
-            LEFT JOIN annotations a ON c.id = a.class_id
-            WHERE c.project_id = ?
+            LEFT JOIN (
+                SELECT a.id, a.class_id
+                FROM annotations a
+                JOIN images i ON a.image_id = i.id
+                WHERE i.project_id = ? {image_filters}
+            ) a ON c.id = a.class_id
+            WHERE c.project_id = ? {class_filters}
             GROUP BY c.name, c.color
             ORDER BY count DESC
             LIMIT 10
-            """,
-            (self.project_id,)
-        ).fetchall()
+        """
+        
+        rows = self.db.conn.execute(query, params).fetchall()
 
         if not rows:
+            ax = self.plot_top_classes.getAxis('bottom')
+            ax.setTicks([])
             return
 
         names = [r[0] for r in rows]
@@ -115,31 +271,44 @@ class AnalyticsWidget(QWidget):
         
         x = range(len(names))
         
-        # Create BarGraphItem
-        bars = pg.BarGraphItem(x=list(x), height=counts, width=0.6, brushes=colors)
-        self.plot_top_classes.addItem(bars)
+        self.bar_item = pg.BarGraphItem(x=list(x), height=counts, width=0.6, brushes=colors)
+        self.plot_top_classes.addItem(self.bar_item)
         
-        # Set x-axis ticks
         ax = self.plot_top_classes.getAxis('bottom')
         ax.setTicks([list(zip(x, names))])
 
     def _update_evolution(self):
         self.plot_evolution.clear()
         
-        # DuckDB query to group by date
-        rows = self.db.conn.execute(
-            """
+        filters = ""
+        params = [self.project_id]
+
+        estado = self.combo_status.currentText()
+        if estado == "annotated":
+            filters += " AND i.status = 'annotated'"
+        elif estado in ["train", "test", "val"]:
+            filters += " AND i.dataset_type = ?"
+            params.append(estado)
+
+        clase_id = self.combo_class.currentData()
+        if clase_id is not None:
+            filters += " AND a.class_id = ?"
+            params.append(clase_id)
+            
+        query = f"""
             SELECT CAST(a.created_at AS DATE) as date, COUNT(a.id) as count
             FROM annotations a
             JOIN images i ON a.image_id = i.id
-            WHERE i.project_id = ?
+            WHERE i.project_id = ? {filters}
             GROUP BY date
             ORDER BY date ASC
-            """,
-            (self.project_id,)
-        ).fetchall()
+        """
+        
+        rows = self.db.conn.execute(query, params).fetchall()
 
         if not rows:
+            ax = self.plot_evolution.getAxis('bottom')
+            ax.setTicks([])
             return
 
         dates_str = [str(r[0]) for r in rows]
