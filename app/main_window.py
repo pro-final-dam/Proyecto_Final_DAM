@@ -196,6 +196,47 @@ class MainWindow(QMainWindow):
         if index == 1:
             self.analytics_page.refresh_data()
 
+    def start_training_from_paths(self, paths: list[str]):
+        """Genera un dataset dinámico a partir de las rutas de imágenes y arranca el entrenamiento YOLO."""
+        from PyQt6.QtWidgets import QMessageBox
+        
+        project = self.labeling_page._project
+        if not project:
+            QMessageBox.warning(self, "Aviso", "No hay un proyecto cargado.")
+            return
+            
+        annotations = {
+            p: project.annotations[p] 
+            for p in paths 
+            if p in project.annotations and project.annotations[p].boxes
+        }
+        
+        if not annotations:
+            QMessageBox.warning(self, "Aviso", "Ninguna de las imágenes pendientes tiene anotaciones válidas.")
+            return
+            
+        classes = self.labeling_page._classes
+        if not classes:
+            QMessageBox.warning(self, "Aviso", "No hay clases definidas en el proyecto.")
+            return
+            
+        import tempfile
+        from app.yolo_exporter import YoloExporter
+        
+        temp_dir = tempfile.mkdtemp(prefix="visionhub_train_")
+        
+        try:
+            yaml_path, _ = YoloExporter.export_dataset(
+                annotations=annotations,
+                classes=classes,
+                output_dir=temp_dir,
+                val_ratio=0.2
+            )
+            self.train_page.set_yaml(yaml_path)
+            self.train_page._toggle_training()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error al generar dataset para entrenamiento: {e}")
+
     # ------------------------------------------------------------------ #
     # Eventos de ventana
     # ------------------------------------------------------------------ #
