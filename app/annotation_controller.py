@@ -64,11 +64,24 @@ class AnnotationController:
     def upsert_image(self, image_path: str, width: int, height: int) -> str:
         """Garantiza que la imagen esté registrada. Devuelve su UUID."""
         row = self._db.conn.execute(
-            "SELECT id FROM images WHERE file_path = ? AND project_id = ?",
+            "SELECT id, status FROM images WHERE file_path = ? AND project_id = ?",
             (image_path, self._project_id),
         ).fetchone()
 
         if row is not None:
+            if row[1] == "deleted":
+                self._db.conn.execute(
+                    """
+                    UPDATE images
+                    SET status = 'unannotated',
+                        annotation_count = 0,
+                        width = ?,
+                        height = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (width, height, datetime.now(timezone.utc), row[0]),
+                )
             return row[0]
 
         new_id = str(uuid.uuid4())
@@ -121,9 +134,9 @@ class AnnotationController:
                         ELSE annotation_count + ?
                     END,
                     updated_at = ?
-                WHERE file_path = ?
+                WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
                 """,
-                (delta, delta, now, image_path),
+                (delta, delta, now, image_path, self._project_id),
             )
             self._db.conn.execute(
                 """
@@ -132,28 +145,160 @@ class AnnotationController:
                         WHEN annotation_count > 0 THEN 'annotated'
                         ELSE 'unannotated'
                     END
-                WHERE file_path = ?
+                WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
                 """,
-                (image_path,),
+                (image_path, self._project_id),
             )
         except Exception as e:
             _log.error("Error al actualizar estado en BD: %s", e, exc_info=e)
             raise
 
+    def sync_image_annotation_summary(self, image_path: str) -> None:
+        """Sincroniza contador/estado de una imagen a partir de sus annotations."""
+        now = datetime.now(timezone.utc)
+        self._db.conn.execute(
+            """
+            UPDATE images
+            SET annotation_count = (
+                    SELECT COUNT(a.id)
+                    FROM annotations a
+                    WHERE a.image_id = images.id
+                ),
+                status = CASE
+                    WHEN (
+                        SELECT COUNT(a.id)
+                        FROM annotations a
+                        WHERE a.image_id = images.id
+                    ) > 0 THEN 'annotated'
+                    ELSE 'unannotated'
+                END,
+                updated_at = ?
+            WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
+            """,
+            (now, image_path, self._project_id),
+        )
+
+    def sync_project_annotation_summaries(self) -> None:
+        """Recalcula contador/estado de todas las imágenes activas del proyecto."""
+        now = datetime.now(timezone.utc)
+        self._db.conn.execute(
+            """
+            UPDATE images
+            SET annotation_count = (
+                    SELECT COUNT(a.id)
+                    FROM annotations a
+                    WHERE a.image_id = images.id
+                ),
+                status = CASE
+                    WHEN (
+                        SELECT COUNT(a.id)
+                        FROM annotations a
+                        WHERE a.image_id = images.id
+                    ) > 0 THEN 'annotated'
+                    ELSE 'unannotated'
+                END,
+                updated_at = ?
+            WHERE project_id = ? AND status <> 'deleted'
+            """,
+            (now, self._project_id),
+        )
+
     def update_split(self, image_path: str, split: str) -> None:
         """Persiste el split de una imagen."""
         self._db.conn.execute(
-            "UPDATE images SET split = ?, updated_at = ? WHERE file_path = ?",
-            (split, datetime.now(timezone.utc), image_path),
+            """
+            UPDATE images
+            SET split = ?, updated_at = ?
+            WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
+            """,
+            (split, datetime.now(timezone.utc), image_path, self._project_id),
         )
+
+    def load_annotation_for_image(self, image_path: str) -> ImageAnnotation | None:
+        """Carga las anotaciones de una única imagen desde la BD. Devuelve None si no existe."""
+        row = self._db.conn.execute(
+            "SELECT id, width, height FROM images WHERE file_path = ? AND project_id = ? AND status <> 'deleted'",
+            (image_path, self._project_id),
+        ).fetchone()
+        if not row or not row[1] or not row[2]:
+            return None
+        img_id, width, height = row
+
+        class_rows = self._db.conn.execute(
+            "SELECT id, name, color, yolo_index FROM classes WHERE project_id = ?",
+            (self._project_id,),
+        ).fetchall()
+        class_map = {r[0]: LabelClass(name=r[1], color=r[2], class_id=r[3]) for r in class_rows}
+
+        ann_rows = self._db.conn.execute(
+            "SELECT id, class_id, x_center, y_center, width, height FROM annotations WHERE image_id = ?",
+            (img_id,),
+        ).fetchall()
+        boxes = []
+        for ann_id, class_id, xc, yc, bw, bh in ann_rows:
+            cls = class_map.get(class_id)
+            if not cls:
+                continue
+            boxes.append(BoundingBox(
+                x=(xc - bw / 2) * width,
+                y=(yc - bh / 2) * height,
+                width=bw * width,
+                height=bh * height,
+                label_class=cls,
+                id=ann_id,
+            ))
+        return ImageAnnotation(image_path=image_path, image_width=width, image_height=height, boxes=boxes)
 
     def load_gallery_splits(self) -> dict[str, str]:
         """Devuelve {file_path: split} para las imágenes del proyecto."""
         rows = self._db.conn.execute(
-            "SELECT file_path, split FROM images WHERE project_id = ?",
+            """
+            SELECT file_path, split
+            FROM images
+            WHERE project_id = ? AND status <> 'deleted'
+            """,
             (self._project_id,),
         ).fetchall()
         return {r[0]: r[1] for r in rows if r[1] and r[1] != "unassigned"}
+
+    def delete_image_from_project(self, image_path: str) -> None:
+        """Quita una imagen del proyecto sin borrar el archivo físico.
+
+        Se borran sus anotaciones y se deja una marca persistente para que,
+        al reabrir un proyecto basado en carpeta, la imagen no se reimporte
+        automáticamente desde el disco.
+        """
+        now = datetime.now(timezone.utc)
+        try:
+            self._db.conn.execute("BEGIN TRANSACTION")
+            self._db.conn.execute(
+                """
+                DELETE FROM annotations
+                WHERE image_id IN (
+                    SELECT id FROM images
+                    WHERE file_path = ? AND project_id = ?
+                )
+                """,
+                (image_path, self._project_id),
+            )
+            self._db.conn.execute(
+                """
+                UPDATE images
+                SET status = 'deleted',
+                    annotation_count = 0,
+                    split = 'unassigned',
+                    updated_at = ?
+                WHERE file_path = ? AND project_id = ?
+                """,
+                (now, image_path, self._project_id),
+            )
+            self._db.conn.execute("COMMIT")
+        except Exception:
+            try:
+                self._db.conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     # ------------------------------------------------------------------ #
     # Clases
@@ -279,6 +424,10 @@ class AnnotationController:
         for box_id in box_ids:
             self._db.conn.execute("DELETE FROM annotations WHERE id = ?", (box_id,))
         self._db.conn.execute(
-            "UPDATE images SET annotation_count = 0, status = 'unannotated', updated_at = ? WHERE file_path = ?",
-            (datetime.now(timezone.utc), image_path),
+            """
+            UPDATE images
+            SET annotation_count = 0, status = 'unannotated', updated_at = ?
+            WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
+            """,
+            (datetime.now(timezone.utc), image_path, self._project_id),
         )

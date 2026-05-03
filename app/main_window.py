@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         else:
             self._project_id = "animales"
             AnnotationController(self._db, self._project_id).seed_default_project()
+        self._project_base_path = base_path or ""
 
         ctrl = AnnotationController(self._db, self._project_id)
         self._build_ui(ctrl)
@@ -108,8 +109,12 @@ class MainWindow(QMainWindow):
 
         self.labeling_page  = LabelingPage(self._db, self._project_id, ctrl)
         self.analytics_page = AnalyticsWidget(db=self._db, project_id=self._project_id)
-        self.train_page     = TrainWidget(db=self._db, project_id=self._project_id)
-        self.inference_page = InferenceWidget()
+        self.train_page     = TrainWidget(
+            db=self._db,
+            project_id=self._project_id,
+            project_base_path=getattr(self, "_project_base_path", "") or "",
+        )
+        self.inference_page = InferenceWidget(db=self._db, project_id=self._project_id)
 
         self._stack.addWidget(self.labeling_page)   # índice 0
         self._stack.addWidget(self.analytics_page)  # índice 1
@@ -185,7 +190,7 @@ class MainWindow(QMainWindow):
         self._nav_group.idClicked.connect(self._on_nav_changed)
         self.labeling_page.status_message.connect(self.status_bar.showMessage)
         self.labeling_page.dataset_exported.connect(self.train_page.set_yaml)
-        self.train_page.dataset_export_requested.connect(self.labeling_page.on_export_dataset)
+        self.train_page.dataset_export_requested.connect(self._export_dataset_for_training)
 
     # ------------------------------------------------------------------ #
     # Navegación entre páginas
@@ -195,6 +200,9 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(index)
         if index == 1:
             self.analytics_page.refresh_data()
+
+    def _export_dataset_for_training(self, output_dir: str) -> None:
+        self.labeling_page.export_dataset_to_dir(output_dir)
 
     def start_training_from_paths(self, paths: list[str]):
         """Genera un dataset dinámico a partir de las rutas de imágenes y arranca el entrenamiento YOLO."""
@@ -220,16 +228,20 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Aviso", "No hay clases definidas en el proyecto.")
             return
             
-        import tempfile
         from app.yolo_exporter import YoloExporter
-        
-        temp_dir = tempfile.mkdtemp(prefix="visionhub_train_")
+
+        training_id = self.train_page._ensure_training_version()
+        if not training_id:
+            QMessageBox.warning(self, "Aviso", "No se pudo crear la version de entrenamiento.")
+            return
+        output_dir = self.train_page._dataset_dir(training_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
         try:
             yaml_path, _ = YoloExporter.export_dataset(
                 annotations=annotations,
                 classes=classes,
-                output_dir=temp_dir,
+                output_dir=str(output_dir),
                 val_ratio=0.2
             )
             self.train_page.set_yaml(yaml_path)

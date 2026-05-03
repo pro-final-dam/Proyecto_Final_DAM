@@ -65,12 +65,15 @@ class YoloExporter:
         Returns:
             (yaml_path, final_splits) — yaml generado y splits definitivos usados.
         """
-        annotated = [p for p, ann in annotations.items() if ann.boxes]
-        if not annotated:
-            raise ValueError("No hay imágenes anotadas para exportar.")
+        dataset_images = [
+            p for p, ann in annotations.items()
+            if ann is not None and Path(p).exists()
+        ]
+        if not dataset_images:
+            raise ValueError("No hay imagenes para exportar.")
 
         output = Path(output_dir)
-        for split in ("train", "val"):
+        for split in ("train", "val", "test"):
             (output / "images" / split).mkdir(parents=True, exist_ok=True)
             (output / "labels" / split).mkdir(parents=True, exist_ok=True)
 
@@ -78,9 +81,9 @@ class YoloExporter:
         final_splits: dict[str, str] = {}
         unassigned: list[str] = []
 
-        for img_path in annotated:
+        for img_path in dataset_images:
             assigned = (splits or {}).get(img_path, 'unassigned')
-            if assigned in ('train', 'val'):
+            if assigned in ('train', 'val', 'test'):
                 final_splits[img_path] = assigned
             else:
                 unassigned.append(img_path)
@@ -96,8 +99,9 @@ class YoloExporter:
             src = Path(img_path)
             shutil.copy2(src, output / "images" / split / src.name)
             lbl_path = output / "labels" / split / src.with_suffix(".txt").name
+            lines = annotations[img_path].to_yolo_lines()
             lbl_path.write_text(
-                "\n".join(annotations[img_path].to_yolo_lines()) + "\n",
+                ("\n".join(lines) + "\n") if lines else "",
                 encoding="utf-8",
             )
 
@@ -107,6 +111,7 @@ class YoloExporter:
             f"path: {output.resolve()}\n"
             f"train: images/train\n"
             f"val: images/val\n"
+            f"test: images/test\n"
             f"\n"
             f"nc: {len(sorted_classes)}\n"
             f"names:\n{names_block}\n"

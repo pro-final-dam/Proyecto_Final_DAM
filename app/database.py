@@ -11,7 +11,9 @@ Uso básico:
 
 from __future__ import annotations
 
+import json
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,6 +119,9 @@ CREATE TABLE IF NOT EXISTS trainings (
     status           VARCHAR DEFAULT 'pending',
     metrics_path     VARCHAR,
     weights_path     VARCHAR,
+    run_dir          VARCHAR,
+    config_path      VARCHAR,
+    config_json      VARCHAR,
     started_at       TIMESTAMP,
     finished_at      TIMESTAMP
 );
@@ -205,6 +210,16 @@ class DatabaseManager:
             self.conn.execute(
                 "ALTER TABLE images ADD COLUMN updated_at TIMESTAMP"
             )
+
+        training_cols = {
+            row[0]
+            for row in self.conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'trainings'"
+            ).fetchall()
+        }
+        for col_name in ("run_dir", "config_path", "config_json"):
+            if col_name not in training_cols:
+                self.conn.execute(f"ALTER TABLE trainings ADD COLUMN {col_name} VARCHAR")
 
         # Eliminar el UNIQUE(file_path) incorrecto si existe — la misma imagen
         # puede pertenecer a varios proyectos, el constraint correcto es (project_id, file_path)
@@ -333,12 +348,13 @@ class DatabaseManager:
             Lista de dicts con las columnas de la tabla images.
         """
         rows = self.conn.execute(
-            "SELECT * FROM images WHERE project_id = ?",
+            "SELECT * FROM images WHERE project_id = ? AND status <> 'deleted'",
             (project_id,),
         ).fetchall()
         columns = [
             "id", "project_id", "file_path", "split",
-            "width", "height", "status", "created_at",
+            "width", "height", "status", "annotation_count",
+            "created_at", "updated_at",
         ]
         return [dict(zip(columns, row)) for row in rows]
 
@@ -379,6 +395,9 @@ class DatabaseManager:
         image_size: int,
         batch_size: int,
         status: str = "running",
+        run_dir: str = "",
+        config_path: str = "",
+        config_json: str = "",
     ) -> None:
         """Crea un registro de entrenamiento en la tabla trainings."""
         now = datetime.now(timezone.utc)
@@ -386,8 +405,8 @@ class DatabaseManager:
             """
             INSERT INTO trainings
                 (id, project_id, model_name, dataset_yaml_path, epochs, image_size,
-                 batch_size, status, started_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 batch_size, status, run_dir, config_path, config_json, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 training_id,
@@ -398,6 +417,9 @@ class DatabaseManager:
                 image_size,
                 batch_size,
                 status,
+                run_dir,
+                config_path,
+                config_json,
                 now,
             ),
         )
@@ -409,6 +431,9 @@ class DatabaseManager:
         status: str,
         metrics_path: str = "",
         weights_path: str = "",
+        run_dir: str = "",
+        config_path: str = "",
+        config_json: str = "",
     ) -> None:
         """Actualiza el estado final de un entrenamiento."""
         now = datetime.now(timezone.utc)
@@ -418,11 +443,27 @@ class DatabaseManager:
             SET status = ?,
                 metrics_path = ?,
                 weights_path = ?,
+                run_dir = COALESCE(NULLIF(?, ''), run_dir),
+                config_path = COALESCE(NULLIF(?, ''), config_path),
+                config_json = COALESCE(NULLIF(?, ''), config_json),
                 finished_at = ?
             WHERE id = ?
             """,
-            (status, metrics_path, weights_path, now, training_id),
+            (status, metrics_path, weights_path, run_dir, config_path, config_json, now, training_id),
         )
+
+    def delete_training_run(self, training_id: str, project_id: str) -> int:
+        """Elimina una version de entrenamiento del proyecto."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM trainings WHERE id = ? AND project_id = ?",
+            (training_id, project_id),
+        ).fetchone()
+        count = row[0] if row else 0
+        self.conn.execute(
+            "DELETE FROM trainings WHERE id = ? AND project_id = ?",
+            (training_id, project_id),
+        )
+        return count
 
     def get_all_projects_with_stats(self) -> list[dict]:
         """Devuelve todos los proyectos con contadores de imágenes y anotaciones."""
@@ -436,7 +477,7 @@ class DatabaseManager:
                 MAX(i.updated_at)                             AS last_activity,
                 MIN(i.file_path)                              AS sample_image
             FROM projects p
-            LEFT JOIN images i ON i.project_id = p.id
+            LEFT JOIN images i ON i.project_id = p.id AND i.status <> 'deleted'
             GROUP BY p.id, p.name, p.description, p.base_path, p.created_at, p.updated_at
             ORDER BY COALESCE(MAX(i.updated_at), p.updated_at) DESC
             """
@@ -447,6 +488,216 @@ class DatabaseManager:
             "image_count", "annotation_count", "last_activity", "sample_image",
         ]
         return [dict(zip(keys, r)) for r in rows]
+
+
+    @staticmethod
+    def _json_value(value):
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return value
+
+    def _rows_as_dicts(self, query: str, params: tuple = ()) -> list[dict]:
+        cursor = self.conn.execute(query, params)
+        columns = [desc[0] for desc in cursor.description]
+        return [
+            {col: self._json_value(value) for col, value in zip(columns, row)}
+            for row in cursor.fetchall()
+        ]
+
+    def export_project_backup(self, project_id: str, output_path: str) -> dict:
+        """Exporta un backup JSON con los datos de BD de un proyecto."""
+        project_rows = self._rows_as_dicts(
+            "SELECT * FROM projects WHERE id = ?",
+            (project_id,),
+        )
+        if not project_rows:
+            raise ValueError("El proyecto no existe en la base de datos.")
+
+        data = {
+            "format": "visionhub_project_backup",
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "project": project_rows[0],
+            "classes": self._rows_as_dicts(
+                "SELECT * FROM classes WHERE project_id = ? ORDER BY yolo_index",
+                (project_id,),
+            ),
+            "images": self._rows_as_dicts(
+                "SELECT * FROM images WHERE project_id = ? ORDER BY file_path",
+                (project_id,),
+            ),
+            "annotations": self._rows_as_dicts(
+                """
+                SELECT a.*
+                FROM annotations a
+                WHERE a.image_id IN (SELECT id FROM images WHERE project_id = ?)
+                   OR a.class_id IN (SELECT id FROM classes WHERE project_id = ?)
+                ORDER BY a.created_at, a.id
+                """,
+                (project_id, project_id),
+            ),
+            "trainings": self._rows_as_dicts(
+                "SELECT * FROM trainings WHERE project_id = ? ORDER BY started_at",
+                (project_id,),
+            ),
+        }
+
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        return {
+            "classes": len(data["classes"]),
+            "images": len(data["images"]),
+            "annotations": len(data["annotations"]),
+            "trainings": len(data["trainings"]),
+            "path": str(out),
+        }
+
+    def import_project_backup(self, backup_path: str) -> dict:
+        """Importa un backup JSON como un proyecto nuevo y remapea sus IDs."""
+        data = json.loads(Path(backup_path).read_text(encoding="utf-8"))
+        if data.get("format") != "visionhub_project_backup":
+            raise ValueError("El archivo no es un backup valido de VisionHub.")
+
+        project = data.get("project") or {}
+        now = datetime.now(timezone.utc)
+        new_project_id = str(uuid.uuid4())
+        original_name = project.get("name") or "Proyecto importado"
+        imported_name = f"{original_name} (backup)"
+
+        class_id_map: dict[str, str] = {}
+        image_id_map: dict[str, str] = {}
+
+        self.conn.execute(
+            """
+            INSERT INTO projects (id, name, description, base_path, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                new_project_id,
+                imported_name,
+                project.get("description", ""),
+                project.get("base_path", ""),
+                now,
+                now,
+            ),
+        )
+
+        for cls in data.get("classes", []):
+            new_class_id = str(uuid.uuid4())
+            class_id_map[cls["id"]] = new_class_id
+            self.conn.execute(
+                """
+                INSERT INTO classes (id, project_id, name, color, yolo_index)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    new_class_id,
+                    new_project_id,
+                    cls.get("name", ""),
+                    cls.get("color", "#89b4fa"),
+                    cls.get("yolo_index", 0),
+                ),
+            )
+
+        for image in data.get("images", []):
+            new_image_id = str(uuid.uuid4())
+            image_id_map[image["id"]] = new_image_id
+            self.conn.execute(
+                """
+                INSERT INTO images
+                    (id, project_id, file_path, split, width, height,
+                     status, annotation_count, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_image_id,
+                    new_project_id,
+                    image.get("file_path", ""),
+                    image.get("split", "unassigned"),
+                    image.get("width"),
+                    image.get("height"),
+                    image.get("status", "unannotated"),
+                    image.get("annotation_count", 0),
+                    image.get("created_at") or now,
+                    image.get("updated_at") or now,
+                ),
+            )
+
+        for ann in data.get("annotations", []):
+            old_image_id = ann.get("image_id")
+            old_class_id = ann.get("class_id")
+            if old_image_id not in image_id_map or old_class_id not in class_id_map:
+                continue
+            self.conn.execute(
+                """
+                INSERT INTO annotations
+                    (id, image_id, class_id, x_center, y_center,
+                     width, height, format, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    image_id_map[old_image_id],
+                    class_id_map[old_class_id],
+                    ann.get("x_center", 0),
+                    ann.get("y_center", 0),
+                    ann.get("width", 0),
+                    ann.get("height", 0),
+                    ann.get("format", "yolo_normalized"),
+                    ann.get("created_at") or now,
+                    ann.get("updated_at") or now,
+                ),
+            )
+
+        for training in data.get("trainings", []):
+            self.conn.execute(
+                """
+                INSERT INTO trainings
+                    (id, project_id, model_name, dataset_yaml_path, epochs,
+                     image_size, batch_size, status, metrics_path, weights_path,
+                     run_dir, config_path, config_json, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    new_project_id,
+                    training.get("model_name", ""),
+                    training.get("dataset_yaml_path", ""),
+                    training.get("epochs"),
+                    training.get("image_size"),
+                    training.get("batch_size"),
+                    training.get("status", "pending"),
+                    training.get("metrics_path", ""),
+                    training.get("weights_path", ""),
+                    training.get("run_dir", ""),
+                    training.get("config_path", ""),
+                    training.get("config_json", ""),
+                    training.get("started_at"),
+                    training.get("finished_at"),
+                ),
+            )
+
+        annotation_count = self.conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM annotations a
+            JOIN images i ON a.image_id = i.id
+            WHERE i.project_id = ?
+            """,
+            (new_project_id,),
+        ).fetchone()[0]
+
+        return {
+            "project_id": new_project_id,
+            "name": imported_name,
+            "base_path": project.get("base_path", ""),
+            "classes": len(class_id_map),
+            "images": len(image_id_map),
+            "annotations": annotation_count,
+            "trainings": len(data.get("trainings", [])),
+        }
 
     def delete_project_cascade(self, project_id: str) -> dict:
         """Elimina un proyecto y todos sus datos asociados.
@@ -469,7 +720,6 @@ class DatabaseManager:
             "projects": 0,
         }
 
-        self.conn.execute("BEGIN TRANSACTION")
         try:
             summary["annotations"] = self.conn.execute(
                 """
@@ -522,6 +772,10 @@ class DatabaseManager:
                 """,
                 (project_id, project_id),
             )
+
+            # DuckDB comprueba algunas FKs contra el estado confirmado. Ejecutar
+            # la cascada por fases en autocommit evita falsos bloqueos al borrar
+            # padres justo después de borrar hijos.
 
             # 2) Limpieza defensiva por FKs reales del esquema.
             #    Si existen tablas adicionales que referencian images/classes/projects,
@@ -679,10 +933,7 @@ class DatabaseManager:
             self.conn.execute("DELETE FROM images WHERE project_id = ?", (project_id,))
             self.conn.execute("DELETE FROM classes WHERE project_id = ?", (project_id,))
             self.conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-
-            self.conn.execute("COMMIT")
         except Exception:
-            self.conn.execute("ROLLBACK")
             raise
 
         return summary
@@ -702,7 +953,11 @@ class DatabaseManager:
         class_map = {r[0]: LabelClass(name=r[1], color=r[2], class_id=r[3]) for r in class_rows}
 
         image_rows = self.conn.execute(
-            "SELECT id, file_path, width, height FROM images WHERE project_id = ?",
+            """
+            SELECT id, file_path, width, height
+            FROM images
+            WHERE project_id = ? AND status <> 'deleted'
+            """,
             (project_id,),
         ).fetchall()
 

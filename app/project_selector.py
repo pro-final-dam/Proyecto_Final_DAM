@@ -22,6 +22,8 @@ from app.database import DatabaseManager
 class ProjectCard(QFrame):
     clicked = pyqtSignal(str, str, str)   # project_id, base_path, name
     edit_requested = pyqtSignal(str, str)    # project_id, project_name
+    delete_requested = pyqtSignal(str, str)  # project_id, project_name
+    backup_requested = pyqtSignal(str, str)  # project_id, project_name
 
     _BORDER_NORMAL = "#313244"
     _BORDER_HOVER  = "#89b4fa"
@@ -119,6 +121,28 @@ class ProjectCard(QFrame):
         )
         self._btn_edit.clicked.connect(self._on_edit_clicked)
         actions.addWidget(self._btn_edit)
+
+        self._btn_backup = QPushButton("Backup")
+        self._btn_backup.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_backup.setFixedHeight(22)
+        self._btn_backup.setStyleSheet(
+            "QPushButton { background: transparent; color: #a6e3a1; border: 1px solid #a6e3a1; "
+            "border-radius: 5px; padding: 0 7px; font-size: 11px; }"
+            "QPushButton:hover { background: rgba(166,227,161,0.15); color: #c8f7c5; border-color: #c8f7c5; }"
+        )
+        self._btn_backup.clicked.connect(self._on_backup_clicked)
+        actions.addWidget(self._btn_backup)
+
+        self._btn_delete = QPushButton("Eliminar")
+        self._btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_delete.setFixedHeight(22)
+        self._btn_delete.setStyleSheet(
+            "QPushButton { background: transparent; color: #f38ba8; border: 1px solid #f38ba8; "
+            "border-radius: 5px; padding: 0 8px; font-size: 11px; }"
+            "QPushButton:hover { background: rgba(243,139,168,0.15); color: #fab4c6; border-color: #fab4c6; }"
+        )
+        self._btn_delete.clicked.connect(self._on_delete_clicked)
+        actions.addWidget(self._btn_delete)
         info_layout.addLayout(actions)
 
         layout.addWidget(info)
@@ -142,8 +166,8 @@ class ProjectCard(QFrame):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            click_pos = event.position().toPoint()
-            if self._btn_edit.geometry().contains(click_pos):
+            child = self.childAt(event.position().toPoint())
+            if child in (self._btn_edit, self._btn_backup, self._btn_delete):
                 super().mousePressEvent(event)
                 return
             self.clicked.emit(
@@ -155,6 +179,12 @@ class ProjectCard(QFrame):
 
     def _on_edit_clicked(self):
         self.edit_requested.emit(self._project["id"], self._project["name"])
+
+    def _on_backup_clicked(self):
+        self.backup_requested.emit(self._project["id"], self._project["name"])
+
+    def _on_delete_clicked(self):
+        self.delete_requested.emit(self._project["id"], self._project["name"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -325,6 +355,11 @@ class ProjectSelectorWindow(QMainWindow):
         header.addLayout(title_col)
         header.addStretch()
 
+        self.btn_import_backup = QPushButton("Importar backup")
+        self.btn_import_backup.setObjectName("btn_primary")
+        self.btn_import_backup.clicked.connect(self._on_import_backup)
+        header.addWidget(self.btn_import_backup)
+
         root.addLayout(header)
         root.addSpacing(32)
 
@@ -365,6 +400,8 @@ class ProjectSelectorWindow(QMainWindow):
             card = ProjectCard(p)
             card.clicked.connect(self.project_selected)
             card.edit_requested.connect(self._on_edit_project_name)
+            card.backup_requested.connect(self._on_export_backup)
+            card.delete_requested.connect(self._on_delete_project)
             self._grid.addWidget(card, row, c)
             col += 1
 
@@ -401,6 +438,108 @@ class ProjectSelectorWindow(QMainWindow):
                 self,
                 "Error al renombrar",
                 f"No se pudo renombrar el proyecto.\n\nDetalle: {e}",
+            )
+
+    def _on_export_backup(self, project_id: str, project_name: str):
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in project_name)
+        default_path = str(Path.home() / "Documents" / f"{safe_name}_backup.json")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Generar backup del proyecto",
+            default_path,
+            "VisionHub backup (*.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+
+        try:
+            summary = self._db.export_project_backup(project_id, path)
+            QMessageBox.information(
+                self,
+                "Backup generado",
+                (
+                    f"Backup guardado en:\n{summary['path']}\n\n"
+                    f"Imágenes: {summary['images']}\n"
+                    f"Anotaciones: {summary['annotations']}\n"
+                    f"Clases: {summary['classes']}\n"
+                    f"Entrenamientos: {summary['trainings']}"
+                ),
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error al generar backup",
+                f"No se pudo generar el backup.\n\nDetalle: {e}",
+            )
+
+    def _on_import_backup(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar backup",
+            str(Path.home() / "Documents"),
+            "VisionHub backup (*.json)",
+        )
+        if not path:
+            return
+
+        try:
+            summary = self._db.import_project_backup(path)
+            self._load_projects()
+            QMessageBox.information(
+                self,
+                "Backup importado",
+                (
+                    f"Proyecto creado: {summary['name']}\n\n"
+                    f"Imágenes: {summary['images']}\n"
+                    f"Anotaciones: {summary['annotations']}\n"
+                    f"Clases: {summary['classes']}\n"
+                    f"Entrenamientos: {summary['trainings']}"
+                ),
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error al importar backup",
+                f"No se pudo importar el backup.\n\nDetalle: {e}",
+            )
+
+    def _on_delete_project(self, project_id: str, project_name: str):
+        reply = QMessageBox.question(
+            self,
+            "Eliminar proyecto",
+            (
+                f"¿Eliminar el proyecto '{project_name}'?\n\n"
+                "Se borrarán de la base de datos todas sus imágenes, clases, "
+                "anotaciones, entrenamientos y referencias relacionadas.\n\n"
+                "Los archivos físicos de imágenes no se eliminarán del disco."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            summary = self._db.delete_project_cascade(project_id)
+            self._load_projects()
+            QMessageBox.information(
+                self,
+                "Proyecto eliminado",
+                (
+                    f"Proyecto '{project_name}' eliminado correctamente.\n\n"
+                    f"Imágenes: {summary.get('images', 0)}\n"
+                    f"Anotaciones: {summary.get('annotations', 0)}\n"
+                    f"Clases: {summary.get('classes', 0)}\n"
+                    f"Entrenamientos: {summary.get('trainings', 0)}"
+                ),
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Error al eliminar",
+                f"No se pudo eliminar el proyecto.\n\nDetalle: {e}",
             )
 
     def closeEvent(self, event):

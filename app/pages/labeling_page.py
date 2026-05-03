@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import ast
 import logging
+import zipfile
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel, QPushButton, QToolButton,
     QListWidget, QListWidgetItem, QFileDialog, QMessageBox, QSizePolicy, QDialog,
-    QScrollArea, QSlider, QStyle,
+    QProgressDialog, QScrollArea, QSlider, QStyle,
 )
-from PyQt6.QtCore import Qt, QSize, QRectF, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QRectF, QThread, pyqtSignal
 from PyQt6.QtGui import QCursor, QPixmap, QColor, QPainter, QBrush, QPen
 
 from app.canvas import AnnotationCanvas, BBoxItem
@@ -98,6 +100,132 @@ _ACCENT     = "#89b4fa"
 _ITEM_BG    = "#1e1e2e"
 _ITEM_HV    = "#2a2a3c"
 _ITEM_SEL   = "#313244"
+
+
+class _YoloImportWorker(QThread):
+    progress_msg  = pyqtSignal(str)
+    finished_ok   = pyqtSignal(list, list, str)   # class_names, image_records, dataset_root
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, zip_path: str, base_dir: str, parent=None):
+        super().__init__(parent)
+        self._zip_path = zip_path
+        self._base_dir = base_dir
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        try:
+            import cv2 as _cv2
+            from app.project import SUPPORTED_EXTENSIONS
+
+            source = Path(self._zip_path)
+            self.progress_msg.emit("Extrayendo ZIP…")
+            dataset_root = self._extract(source, Path(self._base_dir))
+
+            self.progress_msg.emit("Leyendo clases…")
+            class_names = self._read_class_names(dataset_root)
+            if not class_names:
+                self.error_occurred.emit("No se encontraron clases en data.yaml ni classes.txt.")
+                return
+
+            all_images = sorted(
+                p for p in dataset_root.rglob("*")
+                if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
+            )
+            total = len(all_images)
+            image_records: list[dict] = []
+            for i, img_path in enumerate(all_images, 1):
+                if self._cancelled:
+                    return
+                self.progress_msg.emit(f"Procesando {i}/{total}: {img_path.name}")
+                img = _cv2.imread(str(img_path))
+                if img is None:
+                    continue
+                h, w = img.shape[:2]
+                split = self._detect_split(img_path)
+                label_path = self._find_label(img_path)
+                boxes = self._parse_labels(label_path) if (label_path and label_path.exists()) else []
+                image_records.append({"path": str(img_path), "width": w, "height": h, "boxes": boxes, "split": split})
+
+            self.finished_ok.emit(class_names, image_records, str(dataset_root))
+        except Exception as exc:
+            self.error_occurred.emit(str(exc))
+
+    def _extract(self, source: Path, base_dir: Path) -> Path:
+        safe_stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source.stem)
+        target = base_dir / "imported_datasets" / safe_stem
+        suffix = 1
+        while target.exists():
+            suffix += 1
+            target = base_dir / "imported_datasets" / f"{safe_stem}_{suffix}"
+        target.mkdir(parents=True, exist_ok=False)
+        with zipfile.ZipFile(source) as zf:
+            for member in zf.infolist():
+                try:
+                    (target / member.filename).resolve().relative_to(target.resolve())
+                except ValueError:
+                    raise ValueError(f"Ruta insegura dentro del ZIP: {member.filename}")
+            zf.extractall(target)
+        return target
+
+    def _read_class_names(self, dataset_root: Path) -> list[str]:
+        yaml_path = next(dataset_root.rglob("data.yaml"), None)
+        if yaml_path:
+            lines = yaml_path.read_text(encoding="utf-8").splitlines()
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped.startswith("names:"):
+                    continue
+                value = stripped.split(":", 1)[1].strip()
+                if value:
+                    parsed = ast.literal_eval(value)
+                    if isinstance(parsed, dict):
+                        return [str(parsed[k]) for k in sorted(parsed, key=lambda x: int(x))]
+                    if isinstance(parsed, list):
+                        return [str(v) for v in parsed]
+                names: list[str] = []
+                for child in lines[i + 1:]:
+                    child = child.strip()
+                    if not child:
+                        continue
+                    if not child.startswith("-"):
+                        break
+                    names.append(child[1:].strip().strip("'\""))
+                if names:
+                    return names
+        classes_path = next(dataset_root.rglob("classes.txt"), None)
+        if classes_path:
+            return [ln.strip() for ln in classes_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        return []
+
+    def _detect_split(self, img_path: Path) -> str | None:
+        split_map = {"train": "train", "valid": "val", "val": "val", "test": "test"}
+        for part in img_path.parts:
+            if part.lower() in split_map:
+                return split_map[part.lower()]
+        return None
+
+    def _find_label(self, img_path: Path) -> Path | None:
+        parts = list(img_path.parts)
+        if "images" in parts:
+            parts[parts.index("images")] = "labels"
+            return Path(*parts).with_suffix(".txt")
+        sibling = img_path.with_suffix(".txt")
+        return sibling if sibling.exists() else None
+
+    def _parse_labels(self, label_path: Path) -> list[tuple]:
+        boxes = []
+        for line in label_path.read_text(encoding="utf-8").splitlines():
+            parts = line.strip().split()
+            if len(parts) == 5:
+                try:
+                    boxes.append((int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])))
+                except ValueError:
+                    pass
+        return boxes
 
 
 class LabelingPage(QWidget):
@@ -225,12 +353,6 @@ class LabelingPage(QWidget):
         self.lbl_current_image.setMaximumWidth(160)
         name_layout.addWidget(self.lbl_current_image, 1)
 
-        self.lbl_gallery_count = QLabel("")
-        self.lbl_gallery_count.setStyleSheet(
-            f"color: {_TEXT_DIM}; font-size: 10px; background: {_ITEM_SEL};"
-            f" border-radius: 8px; padding: 1px 5px;"
-        )
-        name_layout.addWidget(self.lbl_gallery_count)
 
         self.btn_delete_image = QToolButton()
         self.btn_delete_image.setText("🗑")
@@ -282,6 +404,7 @@ class LabelingPage(QWidget):
 
         # — Galería —
         layout.addWidget(self._section_header("GALERÍA"))
+        layout.addWidget(self._build_gallery_filter_row())
         self.gallery = GalleryWidget()
         self.gallery.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.gallery, 1)
@@ -339,6 +462,48 @@ class LabelingPage(QWidget):
 
         return panel
 
+    # ── Filtro de galería ────────────────────────────────────────────── #
+
+    def _build_gallery_filter_row(self) -> QFrame:
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: {_PANEL_BG}; border-bottom: 1px solid {_PANEL_SEP}; }}"
+        )
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(8, 5, 8, 5)
+
+        from PyQt6.QtWidgets import QComboBox
+        self._filter_combo = QComboBox()
+        self._filter_combo.setStyleSheet("""
+            QComboBox {
+                background: #1e1e2e;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 3px 8px;
+                font-size: 11px;
+            }
+            QComboBox::drop-down { border: none; width: 18px; }
+            QComboBox::down-arrow { image: none; width: 0; }
+            QComboBox QAbstractItemView {
+                background: #1e1e2e;
+                color: #cdd6f4;
+                border: 1px solid #45475a;
+                selection-background-color: #313244;
+            }
+        """)
+        self._filter_combo.addItem('Todos',  'all')
+        self._filter_combo.addItem('Train',  'train')
+        self._filter_combo.addItem('Val',    'val')
+        self._filter_combo.addItem('Test',   'test')
+        self._filter_combo.currentIndexChanged.connect(self._on_gallery_filter_combo)
+        lay.addWidget(self._filter_combo)
+        return row
+
+    def _on_gallery_filter_combo(self, index: int) -> None:
+        split = self._filter_combo.itemData(index)
+        self.gallery.set_split_filter(None if split == 'all' else split)
+
     # ── Barra de herramientas: Guardar / Exportar / Importar + Dibujar ── #
 
     def _build_toolbar_row(self) -> QFrame:
@@ -360,6 +525,7 @@ class LabelingPage(QWidget):
 
         self.btn_save = QPushButton("💾 Guardar")
         self.btn_save.setObjectName("btn_primary")
+        self.btn_save.setVisible(False)
         r1.addWidget(self.btn_save)
 
         self.btn_export = QPushButton("⬆ Exportar YOLO")
@@ -567,7 +733,7 @@ class LabelingPage(QWidget):
         self.btn_prev.clicked.connect(self._on_prev)
         self.btn_next.clicked.connect(self._on_next)
         self.btn_draw.clicked.connect(self._on_draw_clicked)
-        self.btn_export.clicked.connect(self._on_export_yolo)
+        self.btn_export.clicked.connect(self.on_export_dataset)
         self.btn_import_yolo.clicked.connect(self._on_import_yolo)
 
         self.btn_delete_image.clicked.connect(self._on_delete_image)
@@ -709,16 +875,32 @@ class LabelingPage(QWidget):
         from app.project import SUPPORTED_EXTENSIONS
 
         rows = self._db.conn.execute(
-            "SELECT file_path FROM images WHERE project_id = ? ORDER BY file_path",
+            """
+            SELECT file_path
+            FROM images
+            WHERE project_id = ? AND status <> 'deleted'
+            ORDER BY file_path
+            """,
             (project_id,),
         ).fetchall()
-        images_from_db = [r[0] for r in rows if r and r[0] and Path(r[0]).exists()]
+        images_from_db = [r[0] for r in rows if r and r[0]]
+
+        deleted_rows = self._db.conn.execute(
+            """
+            SELECT file_path
+            FROM images
+            WHERE project_id = ? AND status = 'deleted'
+            """,
+            (project_id,),
+        ).fetchall()
+        deleted_paths = {r[0] for r in deleted_rows if r and r[0]}
 
         images_from_folder: list[str] = []
         if base_path and Path(base_path).exists():
             images_from_folder = sorted([
                 str(f) for f in Path(base_path).iterdir()
                 if f.suffix.lower() in SUPPORTED_EXTENSIONS
+                and str(f) not in deleted_paths
             ])
 
         images = sorted(set(images_from_db + images_from_folder))
@@ -730,7 +912,17 @@ class LabelingPage(QWidget):
             return
 
         project = Project(folder=base_path, image_paths=images)
-        project.annotations = self._db.load_annotations_for_project(project_id)
+        project.annotations = {}
+
+        # Carga solo contadores para los badges — mucho más rápido que cargar todas las anotaciones
+        annotation_counts: dict[str, int] = {
+            r[0]: r[1]
+            for r in self._db.conn.execute(
+                "SELECT file_path, annotation_count FROM images WHERE project_id = ? AND status <> 'deleted'",
+                (project_id,),
+            ).fetchall()
+            if r[1]
+        }
 
         try:
             from datetime import datetime, timezone
@@ -741,7 +933,7 @@ class LabelingPage(QWidget):
         except Exception:
             pass
 
-        self._load_project(project)
+        self._load_project(project, annotation_counts=annotation_counts)
         if images:
             self._navigate_to(images[0], save_current=False)
 
@@ -797,7 +989,6 @@ class LabelingPage(QWidget):
                 self.gallery.update_badge(img_path, len(ann.boxes))
         for file_path, split in self._ctrl.load_gallery_splits().items():
             self.gallery.update_split(file_path, split)
-        self.lbl_gallery_count.setText(f"{self._project.image_count} img")
         self._update_ui_state()
         return len(new)
 
@@ -808,15 +999,19 @@ class LabelingPage(QWidget):
         except Exception as e:
             self._log_db_error("Error al asignar split", e)
 
-    def _load_project(self, project: Project):
+    def _load_project(self, project: Project, annotation_counts: dict[str, int] | None = None):
         self._project = project
         self.gallery.load_images(project.image_paths)
-        for img_path, ann in project.annotations.items():
-            if ann.boxes:
-                self.gallery.update_badge(img_path, len(ann.boxes))
+
+        counts = annotation_counts if annotation_counts is not None else {
+            p: len(a.boxes) for p, a in project.annotations.items() if a.boxes
+        }
+        for img_path, count in counts.items():
+            if count > 0:
+                self.gallery.update_badge(img_path, count)
+
         for file_path, split in self._ctrl.load_gallery_splits().items():
             self.gallery.update_split(file_path, split)
-        self.lbl_gallery_count.setText(f"{project.image_count} img")
         self._update_ui_state()
         self._reload_classes()
 
@@ -833,6 +1028,13 @@ class LabelingPage(QWidget):
 
         self._current_image_path = image_path
         w, h = self.canvas.get_image_size()
+
+        # Carga lazy: solo consulta la BD la primera vez que se visita la imagen
+        if image_path not in self._project.annotations:
+            db_ann = self._ctrl.load_annotation_for_image(image_path)
+            if db_ann:
+                self._project.annotations[image_path] = db_ann
+
         self._annotation = self._project.get_or_create_annotation(image_path, w, h)
         self._ctrl.upsert_image(image_path, w, h)
 
@@ -965,24 +1167,9 @@ class LabelingPage(QWidget):
         path = self._current_image_path
         idx = self._project.index_of(path)
 
-        # Borrar anotaciones y fila de imagen en una transaccion
         try:
-            self._db.conn.execute("BEGIN TRANSACTION")
-            self._db.conn.execute(
-                "DELETE FROM annotations WHERE image_id IN "
-                "(SELECT id FROM images WHERE file_path = ? AND project_id = ?)",
-                (path, self._project_id),
-            )
-            self._db.conn.execute(
-                "DELETE FROM images WHERE file_path = ? AND project_id = ?",
-                (path, self._project_id),
-            )
-            self._db.conn.execute("COMMIT")
+            self._ctrl.delete_image_from_project(path)
         except Exception as e:
-            try:
-                self._db.conn.execute("ROLLBACK")
-            except Exception:
-                pass
             self._log_db_error("Error al eliminar imagen de BD", e)
             return
 
@@ -1004,9 +1191,6 @@ class LabelingPage(QWidget):
                 self.gallery.update_badge(img_path, len(ann.boxes))
         for file_path, split in self._ctrl.load_gallery_splits().items():
             self.gallery.update_split(file_path, split)
-        self.lbl_gallery_count.setText(
-            f"{self._project.image_count} img" if self._project.image_count else ""
-        )
         self._refresh_instances_list()
 
         # Navegar a la imagen más cercana
@@ -1151,8 +1335,12 @@ class LabelingPage(QWidget):
             return
         try:
             row = self._db.conn.execute(
-                "SELECT id, width, height FROM images WHERE file_path = ?",
-                (self._current_image_path,)
+                """
+                SELECT id, width, height
+                FROM images
+                WHERE file_path = ? AND project_id = ? AND status <> 'deleted'
+                """,
+                (self._current_image_path, self._project_id)
             ).fetchone()
             if not row:
                 raise ValueError("La imagen no está registrada en la base de datos.")
@@ -1197,14 +1385,28 @@ class LabelingPage(QWidget):
             QMessageBox.critical(self, "Error", str(e))
 
     def _on_import_yolo(self):
-        """Importa anotaciones desde un .txt YOLO para la imagen actual."""
-        if not self._current_image_path or not self._annotation:
-            return
-        txt_path, _ = QFileDialog.getOpenFileName(
-            self, "Importar anotaciones YOLO", "", "YOLO labels (*.txt)"
+        """Importa un .txt YOLO individual o un dataset YOLO completo en .zip."""
+        import_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Importar YOLO",
+            "",
+            "Dataset YOLO (*.zip);;YOLO labels (*.txt);;Todos (*.*)",
         )
-        if not txt_path:
+        if not import_path:
             return
+
+        if Path(import_path).suffix.lower() == ".zip":
+            self._import_yolo_dataset_zip(import_path)
+            return
+
+        if not self._current_image_path or not self._annotation:
+            QMessageBox.information(
+                self,
+                "Sin imagen",
+                "Para importar un .txt individual primero carga la imagen correspondiente.",
+            )
+            return
+        txt_path = import_path
         try:
             lines = Path(txt_path).read_text(encoding="utf-8").strip().splitlines()
             imported = 0
@@ -1232,25 +1434,177 @@ class LabelingPage(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error al importar", str(e))
 
+    def _import_yolo_dataset_zip(self, zip_path: str) -> None:
+        source = Path(zip_path)
+        try:
+            base_dir = self._dataset_import_base_dir(source)
+            if base_dir is None:
+                return
+
+            self._import_progress = QProgressDialog("Preparando importación…", "Cancelar", 0, 0, self)
+            self._import_progress.setWindowTitle("Importando dataset YOLO")
+            self._import_progress.setMinimumWidth(420)
+            self._import_progress.setWindowModality(Qt.WindowModality.WindowModal)
+            self._import_progress.show()
+
+            self._import_worker = _YoloImportWorker(zip_path=zip_path, base_dir=str(base_dir))
+            self._import_progress.canceled.connect(self._import_worker.cancel)
+            self._import_worker.progress_msg.connect(self._import_progress.setLabelText)
+            self._import_worker.finished_ok.connect(self._on_import_finished)
+            self._import_worker.error_occurred.connect(self._on_import_error)
+            self._import_worker.finished.connect(self._import_progress.close)
+            self._import_worker.start()
+        except Exception as e:
+            QMessageBox.critical(self, "Error al importar dataset", str(e))
+
+    def _dataset_import_base_dir(self, source: Path) -> Path | None:
+        if self._project and self._project.folder:
+            base = Path(self._project.folder)
+            if str(base):
+                base.mkdir(parents=True, exist_ok=True)
+                return base
+
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Carpeta donde guardar las imágenes importadas",
+            str(source.parent),
+        )
+        if not folder:
+            return None
+
+        project = Project(folder=folder, image_paths=[])
+        self._load_project(project)
+        try:
+            self._db.conn.execute(
+                "UPDATE projects SET base_path = ? WHERE id = ?",
+                (folder, self._project_id),
+            )
+        except Exception:
+            pass
+        return Path(folder)
+
+    def _ensure_imported_classes(self, class_names: list[str]) -> dict[int, LabelClass]:
+        existing_by_name = {c.name: c for c in self._classes}
+        class_map: dict[int, LabelClass] = {}
+
+        for imported_idx, name in enumerate(class_names):
+            if name in existing_by_name:
+                class_map[imported_idx] = existing_by_name[name]
+                continue
+
+            yolo_idx = len(self._classes)
+            color = CLASS_COLORS[yolo_idx % len(CLASS_COLORS)]
+            self._ctrl.insert_class(name, color, yolo_idx)
+            new_class = LabelClass(name=name, color=color, class_id=yolo_idx)
+            self._classes.append(new_class)
+            existing_by_name[name] = new_class
+            class_map[imported_idx] = new_class
+
+        self._reload_classes()
+        refreshed_by_name = {c.name: c for c in self._classes}
+        return {
+            imported_idx: refreshed_by_name[label_class.name]
+            for imported_idx, label_class in class_map.items()
+            if label_class.name in refreshed_by_name
+        }
+
+    def _on_import_finished(self, class_names: list, image_records: list, dataset_root: str) -> None:
+        if not image_records:
+            QMessageBox.warning(self, "Sin imágenes", "No se encontraron imágenes compatibles dentro del ZIP.")
+            return
+
+        class_map = self._ensure_imported_classes(class_names)
+        existing = set(self._project.image_paths) if self._project else set()
+        imported_images = 0
+        imported_boxes = 0
+
+        for record in image_records:
+            image_str = record["path"]
+            w, h = record["width"], record["height"]
+
+            if image_str not in existing:
+                self._project.image_paths.append(image_str)
+                existing.add(image_str)
+                imported_images += 1
+
+            ann = ImageAnnotation(image_path=image_str, image_width=w, image_height=h)
+            for class_idx, xc, yc, w_n, h_n in record["boxes"]:
+                cls = class_map.get(class_idx)
+                if cls is None:
+                    continue
+                w_px, h_px = w_n * w, h_n * h
+                bbox = BoundingBox(
+                    x=xc * w - w_px / 2, y=yc * h - h_px / 2,
+                    width=w_px, height=h_px, label_class=cls,
+                )
+                if bbox.is_valid:
+                    ann.add_box(bbox)
+                    imported_boxes += 1
+
+            self._project.annotations[image_str] = ann
+            self._ctrl.upsert_image(image_str, w, h)
+            self._ctrl.persist_annotation(ann)
+            self._ctrl.sync_image_annotation_summary(image_str)
+            if record["split"]:
+                self._ctrl.update_split(image_str, record["split"])
+
+        self._project.image_paths = sorted(self._project.image_paths)
+        self.gallery.load_images(self._project.image_paths)
+        for img_path, ann in self._project.annotations.items():
+            if ann.boxes:
+                self.gallery.update_badge(img_path, len(ann.boxes))
+        for file_path, split in self._ctrl.load_gallery_splits().items():
+            self.gallery.update_split(file_path, split)
+        self._update_ui_state()
+
+        if not self._current_image_path and self._project.image_paths:
+            self._navigate_to(self._project.image_paths[0], save_current=False)
+
+        QMessageBox.information(
+            self, "Dataset importado",
+            f"Importadas {imported_images} imagen(es) y {imported_boxes} etiqueta(s).\n\n"
+            f"Origen extraído en:\n{dataset_root}",
+        )
+        self.status_message.emit(f"Dataset YOLO importado: {imported_images} imagen(es), {imported_boxes} bbox.")
+
+    def _on_import_error(self, msg: str) -> None:
+        QMessageBox.critical(self, "Error al importar dataset", msg)
+
     def on_export_dataset(self):
-        if not self._project:
-            QMessageBox.warning(self, "Sin proyecto", "Abre un proyecto con imágenes primero.")
-            return
-        annotated_count = sum(1 for ann in self._project.annotations.values() if ann.boxes)
-        if annotated_count == 0:
-            QMessageBox.warning(self, "Sin anotaciones", "No hay imágenes anotadas para exportar.")
-            return
         output_dir = QFileDialog.getExistingDirectory(self, "Carpeta de destino del dataset")
         if not output_dir:
             return
+        self.export_dataset_to_dir(output_dir, show_messages=True)
+
+    def export_dataset_to_dir(self, output_dir: str, *, show_messages: bool = False) -> str:
+        if not self._project:
+            if show_messages:
+                QMessageBox.warning(self, "Sin proyecto", "Abre un proyecto con imagenes primero.")
+            return ""
+        if not self._project.image_paths:
+            if show_messages:
+                QMessageBox.warning(self, "Sin imagenes", "No hay imagenes para exportar.")
+            return ""
         try:
+            self._commit_current_annotation()
+            # Con carga lazy, project.annotations solo tiene las imágenes visitadas.
+            # Para exportar cargamos todo desde la BD y sobreescribimos con lo que haya en memoria.
+            all_annotations = self._db.load_annotations_for_project(self._project_id)
+            for path, ann in self._project.annotations.items():
+                all_annotations[path] = ann
+            self._ensure_export_annotations_into(all_annotations)
+
             splits_from_db = {r[0]: r[1] for r in self._db.conn.execute(
-                "SELECT file_path, split FROM images WHERE project_id = ?",
+                """
+                SELECT file_path, split
+                FROM images
+                WHERE project_id = ? AND status <> 'deleted'
+                """,
                 (self._project_id,),
             ).fetchall()}
 
             yaml_path, final_splits = YoloExporter.export_dataset(
-                annotations=self._project.annotations,
+                annotations=all_annotations,
                 classes=self._classes,
                 output_dir=output_dir,
                 splits=splits_from_db,
@@ -1261,15 +1615,39 @@ class LabelingPage(QWidget):
                 self.gallery.update_split(img_path, split)
 
             train_count = sum(1 for s in final_splits.values() if s == "train")
-            val_count   = sum(1 for s in final_splits.values() if s == "val")
+            val_count = sum(1 for s in final_splits.values() if s == "val")
+            test_count = sum(1 for s in final_splits.values() if s == "test")
             self.dataset_exported.emit(yaml_path)
-            QMessageBox.information(
-                self, "Dataset generado",
-                f"Dataset listo en:\n{output_dir}\n\n"
-                f"Train: {train_count} imágenes\nVal: {val_count} imágenes",
-            )
+            if show_messages:
+                QMessageBox.information(
+                    self, "Dataset generado",
+                    f"Dataset listo en:\n{output_dir}\n\n"
+                    f"Train: {train_count} imagenes\n"
+                    f"Val: {val_count} imagenes\n"
+                    f"Test: {test_count} imagenes",
+                )
+            return yaml_path
         except Exception as e:
-            QMessageBox.critical(self, "Error al exportar dataset", str(e))
+            if show_messages:
+                QMessageBox.critical(self, "Error al exportar dataset", str(e))
+            return ""
+
+    def _ensure_export_annotations_into(self, annotations: dict) -> None:
+        """Garantiza que cada imagen del proyecto tenga entrada en el dict, aunque esté vacía."""
+        if not self._project:
+            return
+        for image_path in self._project.image_paths:
+            if image_path in annotations:
+                continue
+            pix = QPixmap(image_path)
+            if pix.isNull():
+                continue
+            annotations[image_path] = ImageAnnotation(
+                image_path=image_path,
+                image_width=pix.width(),
+                image_height=pix.height(),
+            )
+            self._ctrl.upsert_image(image_path, pix.width(), pix.height())
 
     # ------------------------------------------------------------------ #
     # Zoom
@@ -1310,8 +1688,8 @@ class LabelingPage(QWidget):
         self.btn_save.setEnabled(has_project)
         self.btn_delete_image.setEnabled(has_image)
         self.btn_draw.setEnabled(has_image)
-        self.btn_export.setEnabled(has_image)
-        self.btn_import_yolo.setEnabled(has_image)
+        self.btn_export.setEnabled(has_project)
+        self.btn_import_yolo.setEnabled(True)
         self.btn_clear_all.setEnabled(has_image)
         self.btn_zoom_fit.setEnabled(has_image)
         self.btn_zoom_in.setEnabled(has_image)
