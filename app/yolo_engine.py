@@ -343,7 +343,11 @@ class TrainWidget(QWidget):
         network_box = self._panel("Red neuronal")
         network_form = QFormLayout(network_box)
         self.combo_model = QComboBox()
-        self.combo_model.addItems(["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolo11n.pt", "yolo11s.pt"])
+        self.combo_model.addItems([
+            "yolo26n.pt", "yolo26s.pt", "yolo26m.pt",
+            "yolo11n.pt", "yolo11s.pt",
+            "yolov8n.pt", "yolov8s.pt", "yolov8m.pt",
+        ])
         network_form.addRow("Modelo base:", self.combo_model)
         self.spin_imgsz = QSpinBox()
         self.spin_imgsz.setRange(320, 1536)
@@ -1417,9 +1421,10 @@ class YoloInferenceWorker(QThread):
     frame_ready = pyqtSignal(QImage)
     error_msg = pyqtSignal(str)
 
-    def __init__(self, model_path: str, parent=None):
+    def __init__(self, model_path: str, device: str = "", parent=None):
         super().__init__(parent)
         self.model_path = model_path
+        self.device = device
         self._is_running = True
 
     def run(self):
@@ -1435,12 +1440,16 @@ class YoloInferenceWorker(QThread):
                 self.error_msg.emit("Error: No se pudo acceder a la cámara.")
                 return
 
+            kwargs = {"verbose": False}
+            if self.device:
+                kwargs["device"] = self.device
+
             while self._is_running:
                 ret, frame = cap.read()
                 if not ret:
                     continue
 
-                results = model(frame, verbose=False)
+                results = model(frame, **kwargs)
                 annotated_frame = results[0].plot()
 
                 rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
@@ -1458,14 +1467,71 @@ class YoloInferenceWorker(QThread):
         self.wait()
 
 
+class YoloVideoInferenceWorker(QThread):
+    frame_ready = pyqtSignal(QImage)
+    progress    = pyqtSignal(int, int)
+    error_msg   = pyqtSignal(str)
+
+    def __init__(self, model_path: str, video_path: str, device: str = "", parent=None):
+        super().__init__(parent)
+        self.model_path = model_path
+        self.video_path = video_path
+        self.device  = device
+        self._stop   = False
+        self._paused = False
+
+    def pause(self)  -> None: self._paused = True
+    def resume(self) -> None: self._paused = False
+    def stop(self)   -> None: self._stop = True; self._paused = False
+
+    def run(self) -> None:
+        if not HAS_YOLO:
+            self.error_msg.emit("Error: librería ultralytics no encontrada.")
+            return
+        try:
+            import time
+            model = YOLO(self.model_path)
+            cap = cv2.VideoCapture(self.video_path)
+            if not cap.isOpened():
+                self.error_msg.emit("No se pudo abrir el video.")
+                return
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+            fps   = cap.get(cv2.CAP_PROP_FPS) or 30
+            delay = 1.0 / fps
+            frame_idx = 0
+            while not self._stop:
+                while self._paused and not self._stop:
+                    self.msleep(50)
+                if self._stop:
+                    break
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                infer_kw  = {"verbose": False, **({"device": self.device} if self.device else {})}
+                results   = model(frame, **infer_kw)
+                annotated = results[0].plot()
+                rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb.shape
+                qt_img = QImage(rgb.data.tobytes(), w, h, ch * w, QImage.Format.Format_RGB888)
+                self.frame_ready.emit(qt_img)
+                self.progress.emit(frame_idx, total)
+                frame_idx += 1
+                time.sleep(max(0.0, delay))
+            cap.release()
+            self.progress.emit(total, total)
+        except Exception as e:
+            self.error_msg.emit(f"Error: {str(e)}")
+
+
 class YoloImageInferenceWorker(QThread):
     result_ready = pyqtSignal(QImage)
     error_msg = pyqtSignal(str)
 
-    def __init__(self, model_path: str, image_path: str, parent=None):
+    def __init__(self, model_path: str, image_path: str, device: str = "", parent=None):
         super().__init__(parent)
         self.model_path = model_path
         self.image_path = image_path
+        self.device = device
 
     def run(self):
         if not HAS_YOLO:
@@ -1473,7 +1539,10 @@ class YoloImageInferenceWorker(QThread):
             return
         try:
             model = YOLO(self.model_path)
-            results = model(self.image_path, verbose=False)
+            kwargs = {"verbose": False}
+            if self.device:
+                kwargs["device"] = self.device
+            results = model(self.image_path, **kwargs)
             annotated = results[0].plot()
             rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb.shape
@@ -1491,6 +1560,7 @@ class InferenceWidget(QWidget):
         self._project_id = project_id
         self.worker: YoloInferenceWorker | None = None
         self._img_worker: YoloImageInferenceWorker | None = None
+        self._vid_worker: YoloVideoInferenceWorker | None = None
         self.model_path = "yolov8n.pt"
         self._build_ui()
         self._load_trained_models()
@@ -1542,6 +1612,18 @@ class InferenceWidget(QWidget):
         self.btn_load_file.clicked.connect(self._load_model_from_file)
         model_vlay.addWidget(self.btn_load_file)
 
+        device_row = QHBoxLayout()
+        lbl_dev = QLabel("Dispositivo:")
+        lbl_dev.setStyleSheet("color: #cdd6f4; font-size: 11px;")
+        self.combo_infer_device = QComboBox()
+        self.combo_infer_device.setStyleSheet(
+            "QComboBox { background: #11111b; color: #cdd6f4; border: 1px solid #313244; padding: 3px; }"
+        )
+        self._populate_infer_device_options()
+        device_row.addWidget(lbl_dev)
+        device_row.addWidget(self.combo_infer_device, stretch=1)
+        model_vlay.addLayout(device_row)
+
         self.lbl_model = QLabel(f"Activo: {self.model_path}")
         self.lbl_model.setStyleSheet("color: #a6e3a1; font-size: 11px;")
         model_vlay.addWidget(self.lbl_model)
@@ -1566,8 +1648,14 @@ class InferenceWidget(QWidget):
         self.btn_mode_image.setStyleSheet(_toggle_style)
         self.btn_mode_image.clicked.connect(lambda: self._set_mode("image"))
 
+        self.btn_mode_video = QPushButton("🎬  Video")
+        self.btn_mode_video.setCheckable(True)
+        self.btn_mode_video.setStyleSheet(_toggle_style)
+        self.btn_mode_video.clicked.connect(lambda: self._set_mode("video"))
+
         mode_row.addWidget(self.btn_mode_camera)
         mode_row.addWidget(self.btn_mode_image)
+        mode_row.addWidget(self.btn_mode_video)
         mode_row.addStretch()
         layout.addLayout(mode_row)
 
@@ -1613,11 +1701,74 @@ class InferenceWidget(QWidget):
         img_ctrl.addWidget(self.lbl_image_status, stretch=1)
         img_lay.addLayout(img_ctrl)
 
+        # --- Página video ---
+        self._page_video = QWidget()
+        vid_lay = QVBoxLayout(self._page_video)
+        vid_lay.setContentsMargins(0, 0, 0, 0)
+        vid_lay.setSpacing(8)
+
+        self.lbl_video = QLabel("Sin video")
+        self.lbl_video.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_video.setStyleSheet(_display_style)
+        self.lbl_video.setMinimumSize(640, 420)
+        vid_lay.addWidget(self.lbl_video, stretch=1)
+
+        self.progress_video = QProgressBar()
+        self.progress_video.setMinimum(0)
+        self.progress_video.setValue(0)
+        self.progress_video.setTextVisible(False)
+        self.progress_video.setFixedHeight(4)
+        self.progress_video.setStyleSheet(
+            "QProgressBar { background: #313244; border: none; border-radius: 2px; }"
+            "QProgressBar::chunk { background: #0f9f8f; border-radius: 2px; }"
+        )
+        vid_lay.addWidget(self.progress_video)
+
+        vid_ctrl = QHBoxLayout()
+        self.btn_load_video = QPushButton("📂 Cargar video")
+        self.btn_load_video.setObjectName("btn_primary")
+        self.btn_load_video.clicked.connect(self._load_video)
+
+        self.btn_play_video = QPushButton("▶ Reproducir")
+        self.btn_play_video.setEnabled(False)
+        self.btn_play_video.clicked.connect(self._toggle_video_playback)
+
+        self.btn_stop_video = QPushButton("⏹ Detener")
+        self.btn_stop_video.setEnabled(False)
+        self.btn_stop_video.clicked.connect(self._stop_video)
+
+        self.lbl_video_status = QLabel("")
+        self.lbl_video_status.setStyleSheet("color: #a6adc8; font-size: 11px;")
+
+        vid_ctrl.addWidget(self.btn_load_video)
+        vid_ctrl.addWidget(self.btn_play_video)
+        vid_ctrl.addWidget(self.btn_stop_video)
+        vid_ctrl.addWidget(self.lbl_video_status, stretch=1)
+        vid_lay.addLayout(vid_ctrl)
+
+        self._video_path: str = ""
+
         # --- Stack ---
         self.display_stack = QStackedWidget()
         self.display_stack.addWidget(self._page_camera)  # 0
         self.display_stack.addWidget(self._page_image)   # 1
+        self.display_stack.addWidget(self._page_video)   # 2
         layout.addWidget(self.display_stack, stretch=1)
+
+    def _populate_infer_device_options(self) -> None:
+        self.combo_infer_device.clear()
+        self.combo_infer_device.addItem("Auto (GPU si disponible)", "")
+        self.combo_infer_device.addItem(f"CPU — {platform.processor() or platform.machine()}", "cpu")
+        if HAS_TORCH and torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                try:
+                    name = torch.cuda.get_device_name(idx)
+                except Exception:
+                    name = f"CUDA device {idx}"
+                self.combo_infer_device.addItem(f"GPU {idx} — {name}", str(idx))
+
+    def _infer_device(self) -> str:
+        return self.combo_infer_device.currentData() or ""
 
     def _load_trained_models(self) -> None:
         self.combo_models.blockSignals(True)
@@ -1663,15 +1814,12 @@ class InferenceWidget(QWidget):
             self.combo_models.blockSignals(False)
 
     def _set_mode(self, mode: str) -> None:
-        if mode == "camera":
-            self.btn_mode_camera.setChecked(True)
-            self.btn_mode_image.setChecked(False)
-            self.display_stack.setCurrentIndex(0)
-        else:
-            self.stop_camera()
-            self.btn_mode_camera.setChecked(False)
-            self.btn_mode_image.setChecked(True)
-            self.display_stack.setCurrentIndex(1)
+        self.stop_camera()
+        self._stop_video()
+        self.btn_mode_camera.setChecked(mode == "camera")
+        self.btn_mode_image.setChecked(mode == "image")
+        self.btn_mode_video.setChecked(mode == "video")
+        self.display_stack.setCurrentIndex({"camera": 0, "image": 1, "video": 2}.get(mode, 0))
 
     def stop_camera(self) -> None:
         if self.worker is not None and self.worker.isRunning():
@@ -1689,7 +1837,7 @@ class InferenceWidget(QWidget):
             self.stop_camera()
             return
         self.btn_start.setText("⏹ Detener Cámara")
-        self.worker = YoloInferenceWorker(model_path=self.model_path)
+        self.worker = YoloInferenceWorker(model_path=self.model_path, device=self._infer_device())
         self.worker.frame_ready.connect(self._update_camera_frame)
         self.worker.error_msg.connect(self.lbl_camera.setText)
         self.worker.start()
@@ -1712,7 +1860,7 @@ class InferenceWidget(QWidget):
             return
         self.lbl_image_status.setText("Procesando...")
         self.btn_load_image.setEnabled(False)
-        self._img_worker = YoloImageInferenceWorker(model_path=self.model_path, image_path=path)
+        self._img_worker = YoloImageInferenceWorker(model_path=self.model_path, image_path=path, device=self._infer_device())
         self._img_worker.result_ready.connect(self._show_image_result)
         self._img_worker.error_msg.connect(self._on_image_error)
         self._img_worker.finished.connect(lambda: self.btn_load_image.setEnabled(True))
@@ -1731,3 +1879,80 @@ class InferenceWidget(QWidget):
     def _on_image_error(self, msg: str) -> None:
         self.lbl_image.setText(msg)
         self.lbl_image_status.setText("Error")
+
+    # ------------------------------------------------------------------ #
+    # Video
+    # ------------------------------------------------------------------ #
+
+    def _load_video(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar video", "",
+            "Videos (*.mp4 *.avi *.mov *.mkv *.webm *.m4v)"
+        )
+        if not path:
+            return
+        self._video_path = path
+        self.lbl_video.setText(Path(path).name)
+        self.lbl_video_status.setText("Video cargado")
+        self.progress_video.setValue(0)
+        self.btn_play_video.setEnabled(True)
+        self.btn_play_video.setText("▶ Reproducir")
+        self.btn_stop_video.setEnabled(False)
+
+    def _toggle_video_playback(self) -> None:
+        if self._vid_worker is not None and self._vid_worker.isRunning():
+            if self._vid_worker._paused:
+                self._vid_worker.resume()
+                self.btn_play_video.setText("⏸ Pausar")
+                self.lbl_video_status.setText("Reproduciendo…")
+            else:
+                self._vid_worker.pause()
+                self.btn_play_video.setText("▶ Reanudar")
+                self.lbl_video_status.setText("Pausado")
+        else:
+            if not self._video_path:
+                return
+            self.progress_video.setValue(0)
+            self.btn_play_video.setText("⏸ Pausar")
+            self.btn_stop_video.setEnabled(True)
+            self.lbl_video_status.setText("Reproduciendo…")
+            self._vid_worker = YoloVideoInferenceWorker(
+                model_path=self.model_path,
+                video_path=self._video_path,
+                device=self._infer_device(),
+            )
+            self._vid_worker.frame_ready.connect(self._on_video_frame)
+            self._vid_worker.progress.connect(self._on_video_progress)
+            self._vid_worker.error_msg.connect(self._on_video_error)
+            self._vid_worker.finished.connect(self._on_video_finished)
+            self._vid_worker.start()
+
+    def _stop_video(self) -> None:
+        if self._vid_worker is not None and self._vid_worker.isRunning():
+            self._vid_worker.stop()
+            self._vid_worker = None
+        self.btn_play_video.setText("▶ Reproducir")
+        self.btn_stop_video.setEnabled(False)
+        self.lbl_video_status.setText("")
+
+    def _on_video_frame(self, image: QImage) -> None:
+        pixmap = QPixmap.fromImage(image)
+        self.lbl_video.setPixmap(pixmap.scaled(
+            self.lbl_video.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
+    def _on_video_progress(self, current: int, total: int) -> None:
+        self.progress_video.setMaximum(total)
+        self.progress_video.setValue(current)
+
+    def _on_video_error(self, msg: str) -> None:
+        self.lbl_video.setText(msg)
+        self.lbl_video_status.setText("Error")
+
+    def _on_video_finished(self) -> None:
+        self._vid_worker = None
+        self.btn_play_video.setText("▶ Reproducir")
+        self.btn_stop_video.setEnabled(False)
+        self.lbl_video_status.setText("Finalizado")
