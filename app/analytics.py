@@ -1,20 +1,115 @@
 import pyqtgraph as pg
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame, QGridLayout, QComboBox
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFrame, QGridLayout, QComboBox, QScrollArea, QSizePolicy
 )
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QColor, QPainter, QBrush, QPen, QFont
+import math
 
 from app.database import DatabaseManager
 
+class PieChartItem(pg.GraphicsObject):
+    def __init__(self, data, colors, show_text=True):
+        super().__init__()
+        self.data = data
+        self.colors = [QColor(c) for c in colors]
+        self.show_text = show_text
+        self.rect = QRectF(-40, -40, 80, 80)
+
+    def boundingRect(self):
+        padding = 10
+        return self.rect.adjusted(-padding, -padding, padding, padding)
+
+    def paint(self, p: QPainter, *args):
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        total = sum(self.data)
+        if total == 0:
+            p.setBrush(QBrush(QColor("#585b70")))  # Gris neutro visible para que no parezca un hueco
+            p.setPen(QPen(QColor("#1e1e2e"), 1))
+            p.drawEllipse(self.rect)
+            return
+
+        start_angle = 0
+        for val, color in zip(self.data, self.colors):
+            if val == 0:
+                continue
+            span_angle = (val / total) * 360
+            p.setBrush(QBrush(color))
+            p.setPen(QPen(QColor("#1e1e2e"), 1))
+            p.drawPie(self.rect, int(start_angle * 16), int(span_angle * 16))
+            
+            if self.show_text:
+                mid_angle = start_angle + span_angle / 2
+                rad = math.radians(mid_angle)
+                radius = self.rect.width() / 2
+                tx = math.cos(rad) * (radius * 0.6) + self.rect.center().x()
+                ty = -math.sin(rad) * (radius * 0.6) + self.rect.center().y()
+                
+                p.save()
+                p.translate(tx, ty)
+                p.scale(1, -1)
+                
+                p.setPen(QPen(QColor("#1e1e2e")))
+                font = p.font()
+                font.setPointSize(max(6, int(radius * 0.25)))
+                font.setBold(True)
+                p.setFont(font)
+                
+                text_rect = QRectF(-15, -10, 30, 20)
+                p.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, str(val))
+                
+                p.restore()
+            
+            start_angle += span_angle
+
+class StackedBarWidget(QWidget):
+    def __init__(self, data, colors, parent=None):
+        super().__init__(parent)
+        self.data = data
+        self.colors = [QColor(c) for c in colors]
+        self.setFixedHeight(30)
+        self.setMinimumWidth(150)
+        
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        total = sum(self.data)
+        rect = self.rect()
+        
+        if total == 0:
+            p.setBrush(QColor("#45475a"))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawRect(rect)
+            return
+            
+        current_x = 0
+        width = rect.width()
+        
+        for val, color in zip(self.data, self.colors):
+            if val == 0:
+                continue
+            w = (val / total) * width
+            p.setBrush(color)
+            p.setPen(Qt.PenStyle.NoPen)
+            segment_rect = QRectF(current_x, 0, w, rect.height())
+            p.drawRect(segment_rect)
+            
+            p.setPen(QColor("#1e1e2e"))
+            font = p.font()
+            font.setPointSize(9)
+            font.setBold(True)
+            p.setFont(font)
+            p.drawText(segment_rect, Qt.AlignmentFlag.AlignCenter, str(val))
+            
+            current_x += w
+
 class AnalyticsWidget(QWidget):
-    """Módulo de Inteligencia y Analítica: Visualización de métricas."""
+    """Módulo de Inteligencia y Analítica: Visualización de métricas refactorizado."""
 
     def __init__(self, db: DatabaseManager, project_id: str, parent=None):
         super().__init__(parent)
         self.db = db
         self.project_id = project_id
-        self.bar_item = None
         self._build_ui()
         self._populate_filters()
         self.refresh_data()
@@ -22,7 +117,7 @@ class AnalyticsWidget(QWidget):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(20)
+        layout.setSpacing(15)
 
         # Header
         header = QHBoxLayout()
@@ -66,46 +161,76 @@ class AnalyticsWidget(QWidget):
         
         layout.addWidget(filters_frame)
 
-        # Grid for charts
-        grid = QGridLayout()
-        grid.setSpacing(20)
-        
-        # 1. Top Classes (Bar Chart)
-        self.plot_top_classes = pg.PlotWidget(title="Distribución de clases")
-        self.plot_top_classes.setBackground("#1e1e2e")
-        self.plot_top_classes.setTitle("Distribución de clases", color="#cdd6f4")
-        self.plot_top_classes.setYRange(0, 300)
-        self._draw_health_regions()
-        
-        grid.addWidget(self.plot_top_classes, 0, 0)
+        # Dataset Overview (Pies)
+        lbl_pies = QLabel("Dataset Overview (Pies)")
+        lbl_pies.setStyleSheet("color: #cdd6f4; font-size: 16px; font-weight: bold;")
+        lbl_pies.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(lbl_pies)
 
-        # 2. Evolution (Line Chart)
-        self.plot_evolution = pg.PlotWidget(title="Evolución por fechas")
-        self.plot_evolution.setBackground("#1e1e2e")
-        self.plot_evolution.setTitle("Evolución por fechas", color="#cdd6f4")
-        grid.addWidget(self.plot_evolution, 0, 1)
+        self.pies_scroll = QScrollArea()
+        self.pies_scroll.setWidgetResizable(True)
+        self.pies_scroll.setFixedHeight(220)
+        self.pies_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        self.pies_container = QWidget()
+        self.pies_container.setStyleSheet("background-color: transparent;")
+        self.pies_layout = QHBoxLayout(self.pies_container)
+        self.pies_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.pies_scroll.setWidget(self.pies_container)
+        layout.addWidget(self.pies_scroll)
+
+        # Class Breakdown
+        lbl_bd = QLabel("Class Breakdown (Pies & Bars)")
+        lbl_bd.setStyleSheet("color: #cdd6f4; font-size: 16px; font-weight: bold;")
+        layout.addWidget(lbl_bd)
         
-        # 3. Overall Stats
+        # Header Row
+        header_row = QWidget()
+        header_row.setStyleSheet("background-color: #313244; border-radius: 4px;")
+        h_layout = QHBoxLayout(header_row)
+        h_layout.setContentsMargins(10, 5, 10, 5)
+        headers = [
+            ("Class Name", 2),
+            ("Total\nImages", 1),
+            ("Total\nInstances", 1),
+            ("Label Status\n(check/X)", 1),
+            ("Label Health", 1),
+            ("Instance Distribution", 3),
+            ("Image Distribution", 3)
+        ]
+        for text, stretch in headers:
+            lbl = QLabel(text)
+            lbl.setStyleSheet("color: #bac2de; font-weight: bold; font-size: 12px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            h_layout.addWidget(lbl, stretch)
+        layout.addWidget(header_row)
+
+        self.bd_scroll = QScrollArea()
+        self.bd_scroll.setWidgetResizable(True)
+        self.bd_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        self.bd_container = QWidget()
+        self.bd_container.setStyleSheet("background-color: transparent;")
+        self.bd_layout = QVBoxLayout(self.bd_container)
+        self.bd_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.bd_layout.setSpacing(5)
+        self.bd_scroll.setWidget(self.bd_container)
+        layout.addWidget(self.bd_scroll, 1)
+
+        # Overall Stats
         stats_frame = QFrame()
         stats_frame.setStyleSheet("background: #1e1e2e; border-radius: 8px;")
-        stats_layout = QVBoxLayout(stats_frame)
+        stats_layout = QHBoxLayout(stats_frame)
         self.lbl_total_images = QLabel("Total Imágenes: 0")
         self.lbl_total_boxes = QLabel("Total Anotaciones: 0")
         for lbl in (self.lbl_total_images, self.lbl_total_boxes):
-            lbl.setStyleSheet("color: #89b4fa; font-size: 18px; font-weight: bold;")
+            lbl.setStyleSheet("color: #89b4fa; font-size: 16px; font-weight: bold;")
             stats_layout.addWidget(lbl)
-        grid.addWidget(stats_frame, 1, 0, 1, 2)
-
-        layout.addLayout(grid)
-        layout.setStretchFactor(grid, 1)
+        layout.addWidget(stats_frame)
 
     def _populate_filters(self):
-        # Desactivar señales temporalmente
         self.combo_project.blockSignals(True)
         self.combo_class.blockSignals(True)
         self.combo_status.blockSignals(True)
 
-        # Proyectos
         self.combo_project.clear()
         projects = self.db.conn.execute("SELECT id, name FROM projects").fetchall()
         for p_id, p_name in projects:
@@ -113,19 +238,16 @@ class AnalyticsWidget(QWidget):
             if p_id == self.project_id:
                 self.combo_project.setCurrentIndex(self.combo_project.count() - 1)
 
-        # Clases
         self.combo_class.clear()
         self.combo_class.addItem("Todos", None)
         classes = self.db.conn.execute("SELECT id, name FROM classes WHERE project_id = ?", (self.project_id,)).fetchall()
         for c_id, c_name in classes:
             self.combo_class.addItem(c_name, c_id)
 
-        # Estado
         self.combo_status.clear()
         self.combo_status.addItems(["Todos", "Pendientes", "Entrenados", "Pruebas", "Validaciones"])
-        self.combo_status.setCurrentText("Pendientes")
+        self.combo_status.setCurrentText("Todos")
 
-        # Reactivar señales y conectar a la función central
         self.combo_project.blockSignals(False)
         self.combo_class.blockSignals(False)
         self.combo_status.blockSignals(False)
@@ -152,8 +274,7 @@ class AnalyticsWidget(QWidget):
         self.refresh_data()
 
     def refresh_data(self):
-        self._update_top_classes()
-        self._update_evolution()
+        self._update_dashboard()
         self._update_stats()
 
     def _on_train_pending_clicked(self):
@@ -179,6 +300,168 @@ class AnalyticsWidget(QWidget):
                 else:
                     QMessageBox.warning(self, "Aviso", "No hay imágenes pendientes de entrenar en el proyecto.")
 
+    def _update_dashboard(self):
+        while self.pies_layout.count():
+            item = self.pies_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+                
+        while self.bd_layout.count():
+            item = self.bd_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        estado = self.combo_status.currentText()
+        estado_filter = ""
+        if estado == "Pendientes":
+            estado_filter = " AND (i.split IS NULL OR i.split NOT IN ('train', 'test', 'val')) AND i.status = 'annotated'"
+        elif estado == "Entrenados":
+            estado_filter = " AND i.split = 'train'"
+        elif estado == "Pruebas":
+            estado_filter = " AND i.split = 'test'"
+        elif estado == "Validaciones":
+            estado_filter = " AND i.split = 'val'"
+
+        clase_id = self.combo_class.currentData()
+        class_filters = ""
+        params = [self.project_id, self.project_id]
+        if clase_id is not None:
+            class_filters = " AND c.id = ?"
+            params.append(clase_id)
+
+        query = f"""
+            SELECT 
+                c.id, c.name,
+                COUNT(DISTINCT i.id) as total_images,
+                COUNT(a.id) as total_instances,
+                SUM(CASE WHEN i.split = 'train' THEN 1 ELSE 0 END) as inst_entrenados,
+                SUM(CASE WHEN i.split = 'test' THEN 1 ELSE 0 END) as inst_pruebas,
+                SUM(CASE WHEN i.split = 'val' THEN 1 ELSE 0 END) as inst_validaciones,
+                SUM(CASE WHEN (i.split IS NULL OR i.split NOT IN ('train', 'test', 'val')) AND i.status = 'annotated' THEN 1 ELSE 0 END) as inst_pendientes,
+                COUNT(DISTINCT CASE WHEN i.split = 'train' THEN i.id END) as img_entrenados,
+                COUNT(DISTINCT CASE WHEN i.split = 'test' THEN i.id END) as img_pruebas,
+                COUNT(DISTINCT CASE WHEN i.split = 'val' THEN i.id END) as img_validaciones,
+                COUNT(DISTINCT CASE WHEN (i.split IS NULL OR i.split NOT IN ('train', 'test', 'val')) AND i.status = 'annotated' THEN i.id END) as img_pendientes
+            FROM classes c
+            LEFT JOIN annotations a ON c.id = a.class_id
+            LEFT JOIN images i ON a.image_id = i.id AND i.project_id = ? {estado_filter}
+            WHERE c.project_id = ? {class_filters}
+            GROUP BY c.id, c.name
+            ORDER BY c.name
+        """
+        
+        rows = self.db.conn.execute(query, params).fetchall()
+        
+        colors = ["#f38ba8", "#f9e2af", "#a6e3a1", "#89b4fa"] # Red, Yellow, Green, Blue
+        
+        for r in rows:
+            c_id, c_name = r[0], r[1]
+            t_img, t_inst = r[2], r[3]
+            inst_data = [r[7] or 0, r[4] or 0, r[5] or 0, r[6] or 0] # Pendientes, Entrenados, Pruebas, Validaciones
+            img_data = [r[11] or 0, r[8] or 0, r[9] or 0, r[10] or 0]
+            
+            # --- PIE CHART WIDGET ---
+            pie_widget = QWidget()
+            pie_layout = QVBoxLayout(pie_widget)
+            pie_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+            
+            lbl_name = QLabel(c_name)
+            lbl_name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_name.setStyleSheet("color: #cdd6f4; font-weight: bold; font-size: 14px;")
+            pie_layout.addWidget(lbl_name)
+            
+            plot = pg.PlotWidget()
+            plot.setFixedSize(130, 130)
+            plot.setBackground('transparent')
+            plot.setMouseEnabled(x=False, y=False)
+            plot.hideAxis('left')
+            plot.hideAxis('bottom')
+            pie_item = PieChartItem(inst_data, colors)
+            pie_item.rect = QRectF(-55, -55, 110, 110)
+            plot.addItem(pie_item)
+            pie_layout.addWidget(plot, alignment=Qt.AlignmentFlag.AlignCenter)
+            
+            legend_layout = QVBoxLayout()
+            legend_layout.setSpacing(2)
+            labels = [("Pendientes", "#f38ba8"), ("Entrenados", "#f9e2af"), ("Pruebas", "#a6e3a1"), ("Validación", "#89b4fa")]
+            for text, col in labels:
+                hl = QHBoxLayout()
+                sq = QLabel()
+                sq.setFixedSize(10, 10)
+                sq.setStyleSheet(f"background-color: {col}; border-radius: 2px;")
+                t = QLabel(text)
+                t.setStyleSheet("color: #bac2de; font-size: 10px;")
+                hl.addWidget(sq)
+                hl.addWidget(t)
+                hl.addStretch()
+                legend_layout.addLayout(hl)
+                
+            pie_layout.addLayout(legend_layout)
+            self.pies_layout.addWidget(pie_widget)
+            
+            # --- BREAKDOWN ROW ---
+            row_widget = QFrame()
+            row_widget.setStyleSheet("QFrame { background-color: #1e1e2e; border-bottom: 1px solid #313244; }")
+            r_layout = QHBoxLayout(row_widget)
+            r_layout.setContentsMargins(10, 10, 10, 10)
+            
+            c_widget = QWidget()
+            c_layout = QHBoxLayout(c_widget)
+            c_layout.setContentsMargins(0,0,0,0)
+            c_name_lbl = QLabel(c_name)
+            c_name_lbl.setStyleSheet("color: #cdd6f4; font-weight: bold;")
+            c_layout.addWidget(c_name_lbl)
+            
+            s_plot = pg.PlotWidget()
+            s_plot.setFixedSize(50, 50)
+            s_plot.setBackground('transparent')
+            s_plot.setMouseEnabled(x=False, y=False)
+            s_plot.hideAxis('left')
+            s_plot.hideAxis('bottom')
+            s_pie = PieChartItem(inst_data, colors, show_text=False)
+            s_pie.rect = QRectF(-20, -20, 40, 40)
+            s_plot.addItem(s_pie)
+            c_layout.addWidget(s_plot)
+            r_layout.addWidget(c_widget, 2)
+            
+            t_img_lbl = QLabel(str(t_img))
+            t_img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t_img_lbl.setStyleSheet("color: #cdd6f4;")
+            r_layout.addWidget(t_img_lbl, 1)
+            
+            t_inst_lbl = QLabel(str(t_inst))
+            t_inst_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            t_inst_lbl.setStyleSheet("color: #cdd6f4;")
+            r_layout.addWidget(t_inst_lbl, 1)
+            
+            status_lbl = QLabel("✅" if t_inst > 0 else "❌")
+            status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            r_layout.addWidget(status_lbl, 1)
+            
+            health_lbl = QLabel()
+            health_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            health_lbl.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            if t_inst < 50:
+                health_lbl.setText("CRÍTICO")
+                health_lbl.setStyleSheet("color: #f38ba8;")
+            elif t_inst <= 200:
+                health_lbl.setText("ACEPTABLE")
+                health_lbl.setStyleSheet("color: #f9e2af;")
+            else:
+                health_lbl.setText("ÓPTIMO")
+                health_lbl.setStyleSheet("color: #a6e3a1;")
+            r_layout.addWidget(health_lbl, 1)
+            
+            inst_bar = StackedBarWidget(inst_data, colors)
+            r_layout.addWidget(inst_bar, 3)
+            
+            img_bar = StackedBarWidget(img_data, colors)
+            r_layout.addWidget(img_bar, 3)
+            
+            self.bd_layout.addWidget(row_widget)
+            
+        self.pies_layout.addStretch()
+
     def _update_stats(self):
         filters_img = ""
         params_img = [self.project_id]
@@ -187,16 +470,16 @@ class AnalyticsWidget(QWidget):
 
         estado = self.combo_status.currentText()
         if estado == "Pendientes":
-            filters_img += " AND status = 'annotated'"
-            filters_boxes += " AND i.status = 'annotated'"
+            filters_img += " AND (i.split IS NULL OR i.split NOT IN ('train', 'test', 'val')) AND i.status = 'annotated'"
+            filters_boxes += " AND (i.split IS NULL OR i.split NOT IN ('train', 'test', 'val')) AND i.status = 'annotated'"
         elif estado == "Entrenados":
-            filters_img += " AND split = 'train'"
+            filters_img += " AND i.split = 'train'"
             filters_boxes += " AND i.split = 'train'"
         elif estado == "Pruebas":
-            filters_img += " AND split = 'test'"
+            filters_img += " AND i.split = 'test'"
             filters_boxes += " AND i.split = 'test'"
         elif estado == "Validaciones":
-            filters_img += " AND split = 'val'"
+            filters_img += " AND i.split = 'val'"
             filters_boxes += " AND i.split = 'val'"
             
         clase_id = self.combo_class.currentData()
@@ -223,7 +506,7 @@ class AnalyticsWidget(QWidget):
             row_img = self.db.conn.execute(query_img, params_boxes).fetchone()
         else:
             query_img = f"""
-                SELECT COUNT(id) FROM images 
+                SELECT COUNT(id) FROM images i
                 WHERE project_id = ? {filters_img}
             """
             row_img = self.db.conn.execute(query_img, params_img).fetchone()
@@ -231,221 +514,3 @@ class AnalyticsWidget(QWidget):
         self.lbl_total_images.setText(f"Total Imágenes: {row_img[0] if row_img else 0}")
         self.lbl_total_boxes.setText(f"Total Anotaciones: {row_boxes[0] if row_boxes else 0}")
 
-    def _draw_health_regions(self):
-        self.plot_top_classes.setYRange(0, 300)
-        def add_region(y_min, y_max, color):
-            region = pg.LinearRegionItem([y_min, y_max], orientation='horizontal', movable=False)
-            region.setBrush(pg.mkBrush(color))
-            region.setHoverBrush(pg.mkBrush(color))
-            for line in region.lines:
-                line.setPen(pg.mkPen(None))
-                line.setHoverPen(pg.mkPen(None))
-            region.setZValue(-10)
-            self.plot_top_classes.addItem(region)
-            
-        add_region(0, 50, (255, 0, 0, 30))      # Roja
-        add_region(50, 100, (255, 255, 0, 30))  # Amarilla
-        add_region(100, 200, (0, 255, 0, 30))   # Verde
-        add_region(200, 300, (0, 0, 255, 30))   # Azul
-        
-        line50 = pg.InfiniteLine(pos=50, angle=0, pen=pg.mkPen('y', style=Qt.PenStyle.DashLine))
-        self.plot_top_classes.addItem(line50)
-        line200 = pg.InfiniteLine(pos=200, angle=0, pen=pg.mkPen('g', style=Qt.PenStyle.DashLine))
-        self.plot_top_classes.addItem(line200)
-
-    def _update_top_classes(self):
-        self.plot_top_classes.clear()
-        self._draw_health_regions()
-        if hasattr(self, 'bar_item') and self.bar_item is not None:
-            self.bar_item = None
-            
-        estado = self.combo_status.currentText()
-        image_filters = ""
-        
-        if estado == "Pendientes":
-            image_filters += " AND i.status = 'annotated'"
-        elif estado == "Entrenados":
-            image_filters += " AND i.split = 'train'"
-        elif estado == "Pruebas":
-            image_filters += " AND i.split = 'test'"
-        elif estado == "Validaciones":
-            image_filters += " AND i.split = 'val'"
-
-        class_filters = ""
-        clase_id = self.combo_class.currentData()
-        if clase_id is not None:
-            class_filters += " AND c.id = ?"
-
-        opacity_map = {
-            "Pendientes": 255,
-            "Entrenados": 200,
-            "Pruebas": 140,
-            "Validaciones": 80
-        }
-
-        names = []
-        counts = []
-        colors = []
-
-        if estado == "Todos":
-            query = f"""
-                SELECT c.name,
-                       COALESCE(
-                           CASE 
-                               WHEN i.split = 'train' THEN 'Entrenados'
-                               WHEN i.split = 'test' THEN 'Pruebas'
-                               WHEN i.split = 'val' THEN 'Validaciones'
-                               WHEN i.status = 'annotated' THEN 'Pendientes'
-                           END, 'Otros'
-                       ) as estado_label,
-                       COUNT(a.id) as count, 
-                       c.color
-                FROM classes c
-                LEFT JOIN annotations a ON c.id = a.class_id
-                LEFT JOIN images i ON a.image_id = i.id AND i.project_id = ?
-                WHERE c.project_id = ? {class_filters}
-                GROUP BY c.name, estado_label, c.color
-            """
-            params = [self.project_id, self.project_id]
-            if clase_id is not None:
-                params.append(clase_id)
-                
-            rows = self.db.conn.execute(query, params).fetchall()
-            if not rows:
-                ax = self.plot_top_classes.getAxis('bottom')
-                ax.setTicks([])
-                return
-                
-            classes_data = {}
-            for r in rows:
-                c_name, st_label, count, c_color = r[0], r[1], r[2], r[3]
-                if c_name not in classes_data:
-                    classes_data[c_name] = {'color': c_color, 'counts': {}}
-                if st_label != 'Otros':
-                    classes_data[c_name]['counts'][st_label] = classes_data[c_name]['counts'].get(st_label, 0) + count
-                    
-            ordered_states = ["Pendientes", "Entrenados", "Pruebas", "Validaciones"]
-            
-            for c_name in sorted(classes_data.keys()):
-                c_color = classes_data[c_name]['color']
-                for st in ordered_states:
-                    names.append(f"{c_name} - {st}")
-                    counts.append(classes_data[c_name]['counts'].get(st, 0))
-                    
-                    c = QColor(c_color)
-                    if st in opacity_map:
-                        c.setAlpha(opacity_map[st])
-                    colors.append(pg.mkBrush(c))
-        else:
-            query = f"""
-                SELECT c.name, COUNT(a.id) as count, c.color, '{estado}' as estado_label
-                FROM classes c
-                LEFT JOIN (
-                    SELECT a.id, a.class_id
-                    FROM annotations a
-                    JOIN images i ON a.image_id = i.id
-                    WHERE i.project_id = ? {image_filters}
-                ) a ON c.id = a.class_id
-                WHERE c.project_id = ? {class_filters}
-                GROUP BY c.name, c.color
-                ORDER BY count DESC
-                LIMIT 10
-            """
-            params = [self.project_id, self.project_id]
-            if clase_id is not None:
-                params.append(clase_id)
-        
-            rows = self.db.conn.execute(query, params).fetchall()
-
-            if not rows:
-                ax = self.plot_top_classes.getAxis('bottom')
-                ax.setTicks([])
-                return
-
-            for r in rows:
-                c_name = r[0]
-                count = r[1]
-                color_hex = r[2]
-                names.append(c_name)
-                counts.append(count)
-                colors.append(pg.mkBrush(QColor(color_hex)))
-        
-        x = range(len(names))
-        
-        self.bar_item = pg.BarGraphItem(x=list(x), height=counts, width=0.6, brushes=colors)
-        self.plot_top_classes.addItem(self.bar_item)
-        
-        ax = self.plot_top_classes.getAxis('bottom')
-        ax.setTicks([list(zip(x, names))])
-        
-        from PyQt6.QtGui import QFont
-        font = QFont("Arial", 8)
-        if len(names) > 5:
-            font.setPointSize(7)
-        ax.setTickFont(font)
-
-    def _update_evolution(self):
-        self.plot_evolution.clear()
-        
-        # 1. Obtener TODAS las fechas disponibles en el proyecto
-        dates_query = """
-            SELECT DISTINCT CAST(a.created_at AS DATE) as date
-            FROM annotations a
-            JOIN images i ON a.image_id = i.id
-            WHERE i.project_id = ?
-            ORDER BY date ASC
-        """
-        all_dates_rows = self.db.conn.execute(dates_query, [self.project_id]).fetchall()
-        
-        if not all_dates_rows:
-            ax = self.plot_evolution.getAxis('bottom')
-            ax.setTicks([])
-            return
-            
-        all_dates = [str(r[0]) for r in all_dates_rows]
-        
-        # 2. Obtener los conteos aplicando los filtros seleccionados
-        filters = ""
-        params = [self.project_id]
-
-        estado = self.combo_status.currentText()
-        if estado == "Pendientes":
-            filters += " AND i.status = 'annotated'"
-        elif estado == "Entrenados":
-            filters += " AND i.split = 'train'"
-        elif estado == "Pruebas":
-            filters += " AND i.split = 'test'"
-        elif estado == "Validaciones":
-            filters += " AND i.split = 'val'"
-
-        clase_id = self.combo_class.currentData()
-        if clase_id is not None:
-            filters += " AND a.class_id = ?"
-            params.append(clase_id)
-            
-        query = f"""
-            SELECT CAST(a.created_at AS DATE) as date, COUNT(a.id) as count
-            FROM annotations a
-            JOIN images i ON a.image_id = i.id
-            WHERE i.project_id = ? {filters}
-            GROUP BY date
-        """
-        
-        rows = self.db.conn.execute(query, params).fetchall()
-        counts_dict = {str(r[0]): r[1] for r in rows}
-        
-        # 3. Rellenar con ceros las fechas sin registros
-        counts = [counts_dict.get(d, 0) for d in all_dates]
-        x = range(len(all_dates))
-        
-        pen = pg.mkPen(color='#a6e3a1', width=3)
-        self.plot_evolution.plot(list(x), counts, pen=pen, symbol='o', symbolBrush='#89b4fa')
-        
-        ax = self.plot_evolution.getAxis('bottom')
-        ax.setTicks([list(zip(x, all_dates))])
-        
-        from PyQt6.QtGui import QFont
-        font = QFont("Arial", 8)
-        if len(all_dates) > 5:
-            font.setPointSize(7)
-        ax.setTickFont(font)

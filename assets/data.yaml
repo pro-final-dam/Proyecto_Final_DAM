@@ -1,0 +1,10 @@
+path: C:\Users\cicli\Desktop\Proyecto_Final_DAM\assets
+train: images/train
+val: images/val
+test: images/test
+
+nc: 3
+names:
+  - calf
+  - cow
+  - crane
